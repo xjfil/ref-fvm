@@ -1,11 +1,7 @@
-#[cfg(not(target_arch = "wasm32"))]
-include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
+use fvm_sdk::sys::crypto::compute_unsealed_sector_cid;
 
 #[no_mangle]
-#[cfg(target_arch = "wasm32")]
 pub fn invoke(_: u32) -> u32 {
-    use fvm_sdk::sys::crypto::compute_unsealed_sector_cid;
-
     let piece: Vec<u8> = vec![];
     let mut cid: Vec<u8> = vec![];
 

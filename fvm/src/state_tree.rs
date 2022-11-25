@@ -14,13 +14,10 @@ use fvm_shared::address::{Address, Payload};
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::state::{StateInfo0, StateRoot, StateTreeVersion};
 use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
-use num_traits::Zero;
-#[cfg(feature = "arb")]
-use quickcheck::Arbitrary;
 
 use crate::init_actor::State as InitActorState;
-use crate::kernel::{ClassifyResult, ExecutionError, Result};
-use crate::{syscall_error, EMPTY_ARR_CID};
+use crate::kernel::{ClassifyResult, Context as _, ExecutionError, Result};
+use crate::syscall_error;
 
 /// State tree implementation using hamt. This structure is not threadsafe and should only be used
 /// in sync contexts.
@@ -203,17 +200,13 @@ where
 {
     pub fn new(store: S, version: StateTreeVersion) -> Result<Self> {
         let info = match version {
-            StateTreeVersion::V0
-            | StateTreeVersion::V1
-            | StateTreeVersion::V2
-            | StateTreeVersion::V3
-            | StateTreeVersion::V4 => {
+            StateTreeVersion::V0 | StateTreeVersion::V1 | StateTreeVersion::V2 => {
                 return Err(ExecutionError::Fatal(anyhow!(
                     "unsupported state tree version: {:?}",
                     version
                 )))
             }
-            StateTreeVersion::V5 => {
+            StateTreeVersion::V3 | StateTreeVersion::V4 => {
                 let cid = store
                     .put_cbor(&StateInfo0::default(), multihash::Code::Blake2b256)
                     .context("failed to put state info")
@@ -257,16 +250,13 @@ where
         };
 
         match version {
-            StateTreeVersion::V0
-            | StateTreeVersion::V1
-            | StateTreeVersion::V2
-            | StateTreeVersion::V3
-            | StateTreeVersion::V4 => Err(ExecutionError::Fatal(anyhow!(
-                "unsupported state tree version: {:?}",
-                version
-            ))),
-
-            StateTreeVersion::V5 => {
+            StateTreeVersion::V0 | StateTreeVersion::V1 | StateTreeVersion::V2 => {
+                return Err(ExecutionError::Fatal(anyhow!(
+                    "unsupported state tree version: {:?}",
+                    version
+                )))
+            }
+            StateTreeVersion::V3 | StateTreeVersion::V4 => {
                 let hamt = Hamt::load_with_bit_width(&actors, store, HAMT_BIT_WIDTH)
                     .context("failed to load state tree")
                     .or_fatal()?;
@@ -287,17 +277,16 @@ where
     }
 
     /// Get actor state from an address. Will be resolved to ID address.
-    #[cfg(feature = "testing")]
-    pub fn get_actor_by_address(&self, addr: &Address) -> Result<Option<ActorState>> {
+    pub fn get_actor(&self, addr: &Address) -> Result<Option<ActorState>> {
         let id = match self.lookup_id(addr)? {
             Some(id) => id,
             None => return Ok(None),
         };
-        self.get_actor(id)
+        self.get_actor_id(id)
     }
 
     /// Get actor state from an actor ID.
-    pub fn get_actor(&self, id: ActorID) -> Result<Option<ActorState>> {
+    pub fn get_actor_id(&self, id: ActorID) -> Result<Option<ActorState>> {
         // Check cache for actor state
         Ok(match self.snaps.get_actor(id) {
             StateCacheResult::Exists(state) => Some(state),
@@ -322,8 +311,18 @@ where
         })
     }
 
+    /// Set actor state for an address. Will set state at ID address.
+    pub fn set_actor(&mut self, addr: &Address, actor: ActorState) -> Result<()> {
+        let id = self
+            .lookup_id(addr)?
+            .with_context(|| format!("Resolution lookup failed for {}", addr))
+            .or_fatal()?;
+
+        self.set_actor_id(id, actor)
+    }
+
     /// Set actor state with an actor ID.
-    pub fn set_actor(&mut self, id: ActorID, actor: ActorState) -> Result<()> {
+    pub fn set_actor_id(&mut self, id: ActorID, actor: ActorState) -> Result<()> {
         self.snaps.set_actor(id, actor)
     }
 
@@ -339,7 +338,11 @@ where
 
         let (state, _) = InitActorState::load(self)?;
 
-        let a = match state.resolve_address(self.store(), addr)? {
+        let a = match state
+            .resolve_address(self.store(), addr)
+            .context("Could not resolve address")
+            .or_fatal()?
+        {
             Some(a) => a,
             None => return Ok(None),
         };
@@ -349,17 +352,41 @@ where
         Ok(Some(a))
     }
 
+    /// Delete actor for an address. Will resolve to ID address to delete.
+    pub fn delete_actor(&mut self, addr: &Address) -> Result<()> {
+        let id = self
+            .lookup_id(addr)?
+            .with_context(|| format!("Resolution lookup failed for {}", addr))
+            .or_fatal()?;
+
+        self.delete_actor_id(id)
+    }
+
     /// Delete actor identified by the supplied ID. Returns no error if the actor doesn't exist.
-    pub fn delete_actor(&mut self, id: ActorID) -> Result<()> {
+    pub fn delete_actor_id(&mut self, id: ActorID) -> Result<()> {
         // Remove value from cache
         self.snaps.delete_actor(id)?;
 
         Ok(())
     }
 
+    /// Mutate and set actor state for an Address. Returns false if the actor did not exist. Returns
+    /// a fatal error if the actor doesn't exist.
+    pub fn mutate_actor<F>(&mut self, addr: &Address, mutate: F) -> Result<()>
+    where
+        F: FnOnce(&mut ActorState) -> Result<()>,
+    {
+        let id = match self.lookup_id(addr)? {
+            Some(id) => id,
+            None => return Err(anyhow!("failed to lookup actor {}", addr)).or_fatal(),
+        };
+
+        self.mutate_actor_id(id, mutate)
+    }
+
     /// Mutate and set actor state identified by the supplied ID. Returns a fatal error if the actor
     /// doesn't exist.
-    pub fn mutate_actor<F>(&mut self, id: ActorID, mutate: F) -> Result<()>
+    pub fn mutate_actor_id<F>(&mut self, id: ActorID, mutate: F) -> Result<()>
     where
         F: FnOnce(&mut ActorState) -> Result<()>,
     {
@@ -379,7 +406,7 @@ where
         F: FnOnce(&mut ActorState) -> Result<()>,
     {
         // Retrieve actor state from address
-        let mut act = match self.get_actor(id)? {
+        let mut act = match self.get_actor_id(id)? {
             Some(act) => act,
             None => return Ok(false),
         };
@@ -387,7 +414,7 @@ where
         // Apply function of actor state
         mutate(&mut act)?;
         // Set the actor
-        self.set_actor(id, act)?;
+        self.set_actor_id(id, act)?;
         Ok(true)
     }
 
@@ -403,7 +430,7 @@ where
             .put_cbor(&state, multihash::Code::Blake2b256)
             .or_fatal()?;
 
-        self.set_actor(crate::init_actor::INIT_ACTOR_ID, actor)?;
+        self.set_actor(&crate::init_actor::INIT_ACTOR_ADDR, actor)?;
 
         Ok(new_addr)
     }
@@ -495,41 +522,18 @@ pub struct ActorState {
     pub sequence: u64,
     /// Tokens available to the actor.
     pub balance: TokenAmount,
-    /// The actor's "predictable" address, if assigned.
-    ///
-    /// This field is set on actor creation and never modified.
-    pub address: Option<Address>,
 }
 
 impl ActorState {
     /// Constructor for actor state
-    pub fn new(
-        code: Cid,
-        state: Cid,
-        balance: TokenAmount,
-        sequence: u64,
-        address: Option<Address>,
-    ) -> Self {
+    pub fn new(code: Cid, state: Cid, balance: TokenAmount, sequence: u64) -> Self {
         Self {
             code,
             state,
             sequence,
             balance,
-            address,
         }
     }
-
-    /// Construct a new empty actor with the specified code.
-    pub fn new_empty(code: Cid, address: Option<Address>) -> Self {
-        ActorState {
-            code,
-            state: *EMPTY_ARR_CID,
-            sequence: 0,
-            balance: TokenAmount::zero(),
-            address,
-        }
-    }
-
     /// Safely deducts funds from an Actor
     pub fn deduct_funds(&mut self, amt: &TokenAmount) -> Result<()> {
         if &self.balance < amt {
@@ -544,23 +548,6 @@ impl ActorState {
     /// Deposits funds to an Actor
     pub fn deposit_funds(&mut self, amt: &TokenAmount) {
         self.balance += amt;
-    }
-}
-
-#[cfg(feature = "arb")]
-impl Arbitrary for ActorState {
-    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-        let cid = Cid::new_v1(
-            u64::arbitrary(g),
-            cid::multihash::Multihash::wrap(u64::arbitrary(g), &[u8::arbitrary(g)]).unwrap(),
-        );
-        Self {
-            code: cid,
-            state: cid,
-            sequence: u64::arbitrary(g),
-            balance: TokenAmount::from_atto(u64::arbitrary(g)),
-            address: None,
-        }
     }
 }
 
@@ -650,14 +637,15 @@ mod tests {
     use cid::Cid;
     use fvm_ipld_blockstore::MemoryBlockstore;
     use fvm_ipld_encoding::{CborStore, DAG_CBOR};
+    use fvm_ipld_hamt::Hamt;
     use fvm_shared::address::{Address, SECP_PUB_LEN};
     use fvm_shared::econ::TokenAmount;
     use fvm_shared::state::StateTreeVersion;
-    use fvm_shared::{ActorID, IDENTITY_HASH, IPLD_RAW};
+    use fvm_shared::{IDENTITY_HASH, IPLD_RAW};
     use lazy_static::lazy_static;
 
     use crate::init_actor;
-    use crate::init_actor::INIT_ACTOR_ID;
+    use crate::init_actor::INIT_ACTOR_ADDR;
     use crate::state_tree::{ActorState, StateTree};
 
     lazy_static! {
@@ -677,42 +665,52 @@ mod tests {
 
     #[test]
     fn get_set_cache() {
-        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1, None);
-        let act_a = ActorState::new(empty_cid(), empty_cid(), Default::default(), 2, None);
-        let actor_id = 1;
+        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1);
+        let act_a = ActorState::new(empty_cid(), empty_cid(), Default::default(), 2);
+        let addr = Address::new_id(1);
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
 
         // test address not in cache
-        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
+        assert_eq!(tree.get_actor(&addr).unwrap(), None);
         // test successful insert
-        assert!(tree.set_actor(actor_id, act_s).is_ok());
+        assert!(tree.set_actor(&addr, act_s).is_ok());
         // test inserting with different data
-        assert!(tree.set_actor(actor_id, act_a.clone()).is_ok());
+        assert!(tree.set_actor(&addr, act_a.clone()).is_ok());
         // Assert insert with same data returns ok
-        assert!(tree.set_actor(actor_id, act_a.clone()).is_ok());
+        assert!(tree.set_actor(&addr, act_a.clone()).is_ok());
         // test getting set item
-        assert_eq!(tree.get_actor(actor_id).unwrap().unwrap(), act_a);
+        assert_eq!(tree.get_actor(&addr).unwrap().unwrap(), act_a);
     }
 
     #[test]
     fn delete_actor() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
 
-        let actor_id = 3;
-        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1, None);
-        tree.set_actor(actor_id, act_s.clone()).unwrap();
-        assert_eq!(tree.get_actor(actor_id).unwrap(), Some(act_s));
-        tree.delete_actor(actor_id).unwrap();
-        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
+        let addr = Address::new_id(3);
+        let act_s = ActorState::new(empty_cid(), empty_cid(), Default::default(), 1);
+        tree.set_actor(&addr, act_s.clone()).unwrap();
+        assert_eq!(tree.get_actor(&addr).unwrap(), Some(act_s));
+        tree.delete_actor(&addr).unwrap();
+        assert_eq!(tree.get_actor(&addr).unwrap(), None);
     }
 
     #[test]
     fn get_set_non_id() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
-        let init_state = init_actor::State::new_test(&store);
+        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+
+        // Empty hamt Cid used for testing
+        let e_cid = Hamt::<_, String>::new_with_bit_width(&store, 5)
+            .flush()
+            .unwrap();
+
+        let init_state = init_actor::State {
+            address_map: e_cid,
+            next_id: 100,
+            network_name: "test".to_owned(),
+        };
 
         let state_cid = tree
             .store()
@@ -720,32 +718,25 @@ mod tests {
             .map_err(|e| e.to_string())
             .unwrap();
 
-        let act_s = ActorState::new(
-            *DUMMY_INIT_ACTOR_CODE_ID,
-            state_cid,
-            Default::default(),
-            1,
-            None,
-        );
+        let act_s = ActorState::new(*DUMMY_INIT_ACTOR_CODE_ID, state_cid, Default::default(), 1);
 
         tree.begin_transaction();
-        tree.set_actor(INIT_ACTOR_ID, act_s).unwrap();
+        tree.set_actor(&INIT_ACTOR_ADDR, act_s).unwrap();
 
         // Test mutate function
-        tree.mutate_actor(INIT_ACTOR_ID, |mut actor| {
+        tree.mutate_actor(&INIT_ACTOR_ADDR, |mut actor| {
             actor.sequence = 2;
             Ok(())
         })
         .unwrap();
-        let new_init_s = tree.get_actor(INIT_ACTOR_ID).unwrap();
+        let new_init_s = tree.get_actor(&INIT_ACTOR_ADDR).unwrap();
         assert_eq!(
             new_init_s,
             Some(ActorState {
                 code: *DUMMY_INIT_ACTOR_CODE_ID,
                 state: state_cid,
                 balance: Default::default(),
-                sequence: 2,
-                address: None
+                sequence: 2
             })
         );
 
@@ -759,42 +750,43 @@ mod tests {
     #[test]
     fn test_transactions() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
+        let mut addresses: Vec<Address> = Vec::new();
 
-        let addresses: &[ActorID] = &[101, 102, 103];
+        let test_addresses = vec!["t0100", "t0101", "t0102"];
+        for a in test_addresses.iter() {
+            addresses.push(a.parse().unwrap());
+        }
 
         tree.begin_transaction();
         tree.set_actor(
-            addresses[0],
+            &addresses[0],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
                 1,
-                None,
             ),
         )
         .unwrap();
 
         tree.set_actor(
-            addresses[1],
+            &addresses[1],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
                 1,
-                None,
             ),
         )
         .unwrap();
         tree.set_actor(
-            addresses[2],
+            &addresses[2],
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
                 1,
-                None,
             ),
         )
         .unwrap();
@@ -802,34 +794,31 @@ mod tests {
         tree.flush().unwrap();
 
         assert_eq!(
-            tree.get_actor(addresses[0]).unwrap().unwrap(),
+            tree.get_actor(&addresses[0]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
-                1,
-                None,
+                1
             )
         );
         assert_eq!(
-            tree.get_actor(addresses[1]).unwrap().unwrap(),
+            tree.get_actor(&addresses[1]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
-                1,
-                None,
+                1
             )
         );
 
         assert_eq!(
-            tree.get_actor(addresses[2]).unwrap().unwrap(),
+            tree.get_actor(&addresses[2]).unwrap().unwrap(),
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
-                1,
-                None
+                1
             )
         );
     }
@@ -837,19 +826,19 @@ mod tests {
     #[test]
     fn revert_transaction() {
         let store = MemoryBlockstore::default();
-        let mut tree = StateTree::new(&store, StateTreeVersion::V5).unwrap();
+        let mut tree = StateTree::new(&store, StateTreeVersion::V3).unwrap();
 
-        let actor_id: ActorID = 1;
+        let addr_str = "f01";
+        let addr: Address = addr_str.parse().unwrap();
 
         tree.begin_transaction();
         tree.set_actor(
-            actor_id,
+            &addr,
             ActorState::new(
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 *DUMMY_ACCOUNT_ACTOR_CODE_ID,
                 TokenAmount::from_atto(55),
                 1,
-                None,
             ),
         )
         .unwrap();
@@ -857,7 +846,7 @@ mod tests {
 
         tree.flush().unwrap();
 
-        assert_eq!(tree.get_actor(actor_id).unwrap(), None);
+        assert_eq!(tree.get_actor(&addr).unwrap(), None);
     }
 
     #[test]
@@ -866,8 +855,6 @@ mod tests {
             StateTreeVersion::V0,
             StateTreeVersion::V1,
             StateTreeVersion::V2,
-            StateTreeVersion::V3,
-            StateTreeVersion::V4,
         ];
         let store = MemoryBlockstore::default();
         for v in unsupported {

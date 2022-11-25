@@ -1,4 +1,3 @@
-use fil_integer_overflow_actor::WASM_BINARY as OVERFLOW_BINARY;
 use fvm::executor::{ApplyKind, Executor};
 use fvm_integration_tests::dummy::DummyExterns;
 use fvm_integration_tests::tester::{Account, Tester};
@@ -13,6 +12,9 @@ use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use num_traits::Zero;
 
+const WASM_COMPILED_PATH: &str =
+    "../../target/debug/wbuild/fil_integer_overflow_actor/fil_integer_overflow_actor.compact.wasm";
+
 mod bundles;
 use bundles::*;
 
@@ -25,8 +27,8 @@ pub struct State {
 fn instantiate_tester() -> (Account, Tester<MemoryBlockstore, DummyExterns>, Address) {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V15,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -41,10 +43,16 @@ fn instantiate_tester() -> (Account, Tester<MemoryBlockstore, DummyExterns>, Add
     let actor_address = Address::new_id(10000);
 
     // Get wasm bin
-    let wasm_bin = OVERFLOW_BINARY.unwrap();
+    let wasm_path = std::env::current_dir()
+        .unwrap()
+        .join(WASM_COMPILED_PATH)
+        .canonicalize()
+        .unwrap();
+
+    let wasm_bin = std::fs::read(wasm_path).expect("Unable to read file");
 
     tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
+        .set_actor_from_bin(&wasm_bin, state_cid, actor_address, TokenAmount::zero())
         .unwrap();
 
     (sender[0], tester, actor_address)
@@ -60,7 +68,7 @@ fn integer_overflow() {
 
     // Params setup
     let x: i64 = 10000000000;
-    let params = RawBytes::serialize(x).unwrap();
+    let params = RawBytes::serialize(&x).unwrap();
 
     // Send message to set
     let message = Message {
@@ -80,12 +88,7 @@ fn integer_overflow() {
         .execute_message(message, ApplyKind::Explicit, 100)
         .unwrap();
 
-    assert_eq!(
-        ExitCode::OK,
-        res.msg_receipt.exit_code,
-        "{}",
-        res.failure_info.unwrap()
-    );
+    assert_eq!(ExitCode::OK, res.msg_receipt.exit_code);
 
     // Read inner state value
     let message = Message {

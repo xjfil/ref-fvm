@@ -4,7 +4,6 @@ use std::rc::Rc;
 
 use anyhow::anyhow;
 use cid::Cid;
-use fil_exit_data_actor::WASM_BINARY as EXIT_DATA_BINARY;
 use fil_hello_world_actor::WASM_BINARY as HELLO_BINARY;
 use fil_ipld_actor::WASM_BINARY as IPLD_BINARY;
 use fil_stack_overflow_actor::WASM_BINARY as OVERFLOW_BINARY;
@@ -14,7 +13,6 @@ use fvm_integration_tests::dummy::DummyExterns;
 use fvm_integration_tests::tester::{Account, IntegrationExecutor};
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
 use fvm_ipld_encoding::tuple::*;
-use fvm_ipld_encoding::RawBytes;
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
@@ -22,6 +20,7 @@ use fvm_shared::message::Message;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use num_traits::Zero;
+use wabt::wat2wasm;
 
 mod bundles;
 use bundles::*;
@@ -36,8 +35,8 @@ pub struct State {
 fn hello_world() {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V15,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -82,8 +81,8 @@ fn hello_world() {
 fn ipld() {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V15,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -134,8 +133,8 @@ fn ipld() {
 fn syscalls() {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V16,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -183,114 +182,11 @@ fn syscalls() {
 }
 
 #[test]
-fn exit_data() {
-    // Instantiate tester
-    let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
-        MemoryBlockstore::default(),
-    )
-    .unwrap();
-
-    let sender: [Account; 1] = tester.create_accounts().unwrap();
-
-    let wasm_bin = EXIT_DATA_BINARY.unwrap();
-
-    // Set actor state
-    let actor_state = State::default();
-    let state_cid = tester.set_state(&actor_state).unwrap();
-
-    // Set actor
-    let actor_address = Address::new_id(10000);
-
-    tester
-        .set_actor_from_bin(wasm_bin, state_cid, actor_address, TokenAmount::zero())
-        .unwrap();
-
-    // Instantiate machine
-    tester.instantiate_machine(DummyExterns).unwrap();
-
-    {
-        // Send constructor message
-        let message = Message {
-            from: sender[0].1,
-            to: actor_address,
-            gas_limit: 1000000000,
-            method_num: 1,
-            sequence: 0,
-            ..Message::default()
-        };
-
-        let res = tester
-            .executor
-            .as_mut()
-            .unwrap()
-            .execute_message(message, ApplyKind::Explicit, 100)
-            .unwrap();
-
-        assert!(res.msg_receipt.exit_code.is_success());
-        assert_eq!(
-            res.msg_receipt.return_data,
-            RawBytes::from(vec![1u8, 2u8, 3u8, 3u8, 7u8])
-        );
-    }
-
-    {
-        // send method 2
-        let message = Message {
-            from: sender[0].1,
-            to: actor_address,
-            gas_limit: 1000000000,
-            method_num: 2,
-            sequence: 1,
-            ..Message::default()
-        };
-
-        let res = tester
-            .executor
-            .as_mut()
-            .unwrap()
-            .execute_message(message, ApplyKind::Explicit, 100)
-            .unwrap();
-
-        assert!(res.msg_receipt.exit_code.is_success());
-        assert_eq!(
-            res.msg_receipt.return_data,
-            RawBytes::from(vec![1u8, 2u8, 3u8, 3u8, 7u8])
-        );
-    }
-
-    {
-        // send method 3
-        let message = Message {
-            from: sender[0].1,
-            to: actor_address,
-            gas_limit: 1000000000,
-            method_num: 3,
-            sequence: 2,
-            ..Message::default()
-        };
-
-        let res = tester
-            .executor
-            .unwrap()
-            .execute_message(message, ApplyKind::Explicit, 100)
-            .unwrap();
-
-        assert_eq!(res.msg_receipt.exit_code.value(), 0x42);
-        assert_eq!(
-            res.msg_receipt.return_data,
-            RawBytes::from(vec![1u8, 2u8, 3u8, 3u8, 7u8])
-        );
-    }
-}
-
-#[test]
 fn native_stack_overflow() {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V16,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -311,13 +207,7 @@ fn native_stack_overflow() {
         .unwrap();
 
     // Instantiate machine
-    tester
-        .instantiate_machine_with_config(DummyExterns, |nc| {
-            // The stack overflow test consumed the default 512MiB before it hit the recursion limit.
-            nc.max_exec_memory_bytes = 4 * (1 << 30);
-            nc.max_inst_memory_bytes = 4 * (1 << 30);
-        })
-        .unwrap();
+    tester.instantiate_machine(DummyExterns).unwrap();
 
     let exec_test =
         |exec: &mut ThreadedExecutor<IntegrationExecutor<MemoryBlockstore, DummyExterns>>,
@@ -335,8 +225,6 @@ fn native_stack_overflow() {
             let res = exec
                 .execute_message(message, ApplyKind::Explicit, 100)
                 .unwrap();
-
-            eprintln!("STACKOVERFLOW RESULT = {:?}", res);
 
             res.msg_receipt.exit_code.value()
         };
@@ -362,8 +250,8 @@ fn native_stack_overflow() {
 fn test_exitcode(wat: &str, code: ExitCode) {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V16,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -371,7 +259,7 @@ fn test_exitcode(wat: &str, code: ExitCode) {
     let sender: [Account; 1] = tester.create_accounts().unwrap();
 
     // Get wasm bin
-    let wasm_bin = wat::parse_str(wat).unwrap();
+    let wasm_bin = wat2wasm(wat).unwrap();
 
     // Set actor state
     let actor_state = State { count: 0 };
@@ -466,9 +354,9 @@ fn backtraces() {
       ;; ipld::open
       (type (;0;) (func (param i32 i32) (result i32)))
       (import "ipld" "open" (func $fvm_sdk::sys::ipld::open::syscall (type 0)))
-      ;; vm::abort -> vm::exit
-      (type (;1;) (func (param i32 i32 i32 i32) (result i32)))
-      (import "vm" "exit" (func $fvm_sdk::sys::vm::exit::syscall (type 1)))
+      ;; vm::abort
+      (type (;1;) (func (param i32 i32 i32) (result i32)))
+      (import "vm" "abort" (func $fvm_sdk::sys::vm::abort::syscall (type 1)))
       (memory (export "memory") 1)
       (func (export "invoke") (param $x i32) (result i32)
         (i32.const 123)
@@ -476,8 +364,7 @@ fn backtraces() {
         (call $fvm_sdk::sys::ipld::open::syscall)
         (i32.const 0)
         (i32.const 0)
-        (i32.const 0)
-        (call $fvm_sdk::sys::vm::exit::syscall)
+        (call $fvm_sdk::sys::vm::abort::syscall)
         unreachable
       )
     )
@@ -488,9 +375,9 @@ fn backtraces() {
       ;; ipld::open
       (type (;0;) (func (param i32 i32) (result i32)))
       (import "ipld" "open" (func $fvm_sdk::sys::ipld::open::syscall (type 0)))
-      ;; vm::abort -> vm::exit
-      (type (;1;) (func (param i32 i32 i32 i32) (result i32)))
-      (import "vm" "exit" (func $fvm_sdk::sys::vm::exit::syscall (type 1)))
+      ;; vm::abort
+      (type (;1;) (func (param i32 i32 i32) (result i32)))
+      (import "vm" "abort" (func $fvm_sdk::sys::vm::abort::syscall (type 1)))
       (memory (export "memory") 1)
       (func (export "invoke") (param $x i32) (result i32)
         (i32.const 128)
@@ -505,8 +392,7 @@ fn backtraces() {
         (call $fvm_sdk::sys::ipld::open::syscall)
         (i32.const 0)
         (i32.const 0)
-        (i32.const 0)
-        (call $fvm_sdk::sys::vm::exit::syscall)
+        (call $fvm_sdk::sys::vm::abort::syscall)
         unreachable
       )
     )
@@ -520,8 +406,8 @@ fn backtraces() {
 
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V16,
+        StateTreeVersion::V4,
         blockstore.clone(),
     )
     .unwrap();
@@ -531,10 +417,7 @@ fn backtraces() {
     let state_cid = tester.set_state(&State { count: 0 }).unwrap();
 
     // Set an actor that aborts.
-    let (wasm_abort, wasm_fatal) = (
-        wat::parse_str(WAT_ABORT).unwrap(),
-        wat::parse_str(WAT_FAIL).unwrap(),
-    );
+    let (wasm_abort, wasm_fatal) = (wat2wasm(WAT_ABORT).unwrap(), wat2wasm(WAT_FAIL).unwrap());
     let (abort_address, fatal_address) = (Address::new_id(10000), Address::new_id(10001));
     tester
         .set_actor_from_bin(&wasm_abort, state_cid, abort_address, TokenAmount::zero())

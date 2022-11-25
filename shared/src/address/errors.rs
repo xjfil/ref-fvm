@@ -7,10 +7,10 @@ use data_encoding::DecodeError;
 use thiserror::Error;
 use unsigned_varint::decode::Error as VarintError;
 
-use super::{BLS_PUB_LEN, SECP_PUB_LEN};
+use super::{BLS_PUB_LEN, PAYLOAD_HASH_LEN, SECP_PUB_LEN};
 
 /// Address error
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, PartialEq, Error)]
 pub enum Error {
     #[error("Unknown address network")]
     UnknownNetwork,
@@ -20,7 +20,7 @@ pub enum Error {
     InvalidPayload,
     #[error("Invalid address length")]
     InvalidLength,
-    #[error("Invalid payload length: {0}")]
+    #[error("Invalid payload length, wanted: {} got: {0}", PAYLOAD_HASH_LEN)]
     InvalidPayloadLength(usize),
     #[error("Invalid BLS pub key length, wanted: {} got: {0}", BLS_PUB_LEN)]
     InvalidBLSLength(usize),
@@ -32,8 +32,6 @@ pub enum Error {
     Base32Decoding(#[from] DecodeError),
     #[error("Cannot get id from non id address")]
     NonIDAddress,
-    #[error("Cannot get delegated address from non delegate address")]
-    NonDelegatedAddress,
 }
 
 impl From<num::ParseIntError> for Error {

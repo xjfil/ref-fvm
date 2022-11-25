@@ -51,15 +51,13 @@ lazy_static::lazy_static! {
 
 #[cfg(test)]
 mod test {
-    use cid::Cid;
     use fvm_ipld_blockstore::MemoryBlockstore;
-    use fvm_ipld_encoding::{CborStore, DAG_CBOR};
+    use fvm_ipld_encoding::CborStore;
     use fvm_shared::state::StateTreeVersion;
-    use fvm_shared::IDENTITY_HASH;
-    use multihash::{Code, Multihash};
+    use multihash::Code;
 
     use crate::call_manager::DefaultCallManager;
-    use crate::externs::{Chain, Consensus, Externs, Rand};
+    use crate::externs::{Consensus, Externs, Rand};
     use crate::machine::{DefaultMachine, Engine, Manifest, NetworkConfig};
     use crate::state_tree::StateTree;
     use crate::{executor, DefaultKernel};
@@ -103,19 +101,10 @@ mod test {
         }
     }
 
-    impl Chain for DummyExterns {
-        fn get_tipset_cid(&self, epoch: fvm_shared::clock::ChainEpoch) -> anyhow::Result<Cid> {
-            Ok(Cid::new_v1(
-                DAG_CBOR,
-                Multihash::wrap(IDENTITY_HASH, &epoch.to_be_bytes()).unwrap(),
-            ))
-        }
-    }
-
     #[test]
     fn test_constructor() {
         let mut bs = MemoryBlockstore::default();
-        let mut st = StateTree::new(bs, StateTreeVersion::V5).unwrap();
+        let mut st = StateTree::new(bs, StateTreeVersion::V4).unwrap();
         let root = st.flush().unwrap();
         bs = st.into_store();
 
@@ -127,9 +116,9 @@ mod test {
 
         let actors_cid = bs.put_cbor(&(1, manifest_cid), Code::Blake2b256).unwrap();
 
-        let mc = NetworkConfig::new(fvm_shared::version::NetworkVersion::V18)
+        let mc = NetworkConfig::new(fvm_shared::version::NetworkVersion::V15)
             .override_actors(actors_cid)
-            .for_epoch(0, 0, root);
+            .for_epoch(0, root);
 
         let machine = DefaultMachine::new(
             &Engine::new_default((&mc.network).into()).unwrap(),

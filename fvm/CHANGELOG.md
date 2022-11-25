@@ -4,85 +4,30 @@ Changes to the reference FVM implementation.
 
 ## [Unreleased]
 
-## 3.0.0-alpha.11 [2022-11-18]
+## 2.1.0 [2022-10-13]
 
-- Replace `new_actor_address` with `next_actor_address`. `next_actor_address` has no side effects (until the actor is actually created).
-- Change `next_actor_address` to always use the origin address from the message, as specified. For abstract accounts, we _can't_ lookup a key address (they may only have an f0 and f2 address).
-- Move account creation logic to the call manager.
-  - The call manager owns the relevant state.
-  - The call manager will eventually invoke the constructor directly when creating the actor.
-- Change the `abort` syscall to `exit` to allow:
-  - non-local exits.
-  - returning values on aborts.
-- Add a method to the externs to lookup tipset CIDs.
-- Remove the NetworkContext from the FVM builder API because we no longer expect the user to pass us a list of tipset CIDs.
-- Change kernel internals to merge all network/message "context" methods into single methods returning `*Context` structs.
-- Avoid treating out of memory instantiation errors as fatal.
+Update wasmtime to 1.0.0
 
-## 3.0.0-alpha.10 [2022-11-17]
+## 2.0.0 [2022-10-12]
 
-- Refactor network/message contexts to reduce the number of syscalls.
+Update to wasmtime 0.40.1.
 
-## 3.0.0-alpha.9 [2022-11-16]
+## 2.0.0-alpha.3 [2022-09-12]
 
-- fix: BufferedBlockstore#flush should not reset the write buffer.
+Add support for nv17.
 
-## 3.0.0-alpha.8 [2022-11-15]
+## 2.0.0-alpha.2 [2022-08-31]
 
-- Add support for actor events (FIP-0049).
+- Syscalls:
+    - Added `recover_secp_public_key` syscall
+    - Added debug artifacts syscall (for testing).
+    - Added sha256, keccak256, ripemd160, and blake2b512 to the `hash` syscall.
+- Replaced `TokenAmount` with an actual type (was a type alias).
+- Added gas charges to the execution trace.
 
-## 3.0.0-alpha.7 [2022-11-14]
+## 2.0.0-alpha.1
 
-- MEM-851: Memory expansion gas (#1067)
-- Split `InvokeContext` into two (#1070)
-- Support EAM singleton in manifest (#1005)
-
-## 3.0.0-alpha.6
-
-- update the state-tree version to v5
-- enable instrumentation of sign extension instructions (only relevant to anyone playing around with native actor support).
-
-## 3.0.0-alpha.5
-
-- fix compile issues with f4-as-account feature.
-
-## 3.0.0-alpha.4
-
-- Resolve key addresses from the state tree instead of reaching into the account actor state
-- Temporary workaround: allow validating signatures from embryo f4 addresses
-
-## 3.0.0-alpha.3
-
-- Fix the address length checks in the `create_actor` syscall. The previous release was broken.
-
-## 3.0.0-alpha.2
-
-- Autoload wasm modules from the blockstore if they haven't been preloaded.
-- Add a new `balance_of` syscall.
-- Add a new `tipset_cid` syscall.
-- Add a new `timestamp` syscall.
-- Add syscalls to get the gas limit, premium, and available gas.
-- Add support for f4 addresses and auto-creating "embryos" on first send to an f4 address.
-- Update wasmtime to 1.0.
-- Add support for network version 18.
-
-## 3.0.0-alpha.1
-
-- Add the origin to the `vm::context` syscall.
-- Add an `m2-native` feature to enable native actor deployment.
-
-## 2.0.0...
-
-See `release/v2`
-
-- Added `recover_secp_public_key` syscall
-- API BREAKING: Change `TokenAmount` type from a newtype to a struct.
-- Add support for additional hash functions in actors:
-    - sha256
-    - keccak256
-    - ripemd160
-    - blake2b512
-- API BREAKING: add gas charges to the execution trace.
+Bump major version for breaking changes.
 
 ## 1.1.0 [2022-06-27]
 

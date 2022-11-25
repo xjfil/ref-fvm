@@ -58,7 +58,6 @@ pub mod actor;
 pub mod crypto;
 #[cfg(feature = "debug")]
 pub mod debug;
-pub mod event;
 pub mod gas;
 pub mod ipld;
 pub mod network;
@@ -100,7 +99,6 @@ macro_rules! fvm_syscalls {
     // Returns no values.
     (module = $module:literal; $(#[$attrs:meta])* $v:vis fn $name:ident($($args:ident : $args_ty:ty),*$(,)?) -> Result<()>; $($rest:tt)*) => {
         $(#[$attrs])*
-        #[allow(clippy::missing_safety_doc)]
         $v unsafe fn $name($($args:$args_ty),*) -> Result<(), $crate::sys::ErrorNumber> {
             #[link(wasm_import_module = $module)]
             extern "C" {
@@ -124,7 +122,6 @@ macro_rules! fvm_syscalls {
     // Returns a value.
     (module = $module:literal; $(#[$attrs:meta])* $v:vis fn $name:ident($($args:ident : $args_ty:ty),*$(,)?) -> Result<$ret:ty>; $($rest:tt)*) => {
         $(#[$attrs])*
-        #[allow(clippy::missing_safety_doc)]
         $v unsafe fn $name($($args:$args_ty),*) -> Result<$ret, $crate::sys::ErrorNumber> {
             #[link(wasm_import_module = $module)]
             extern "C" {
@@ -150,7 +147,6 @@ macro_rules! fvm_syscalls {
     // Does not return.
     (module = $module:literal; $(#[$attrs:meta])* $v:vis fn $name:ident($($args:ident : $args_ty:ty),*$(,)?) -> !; $($rest:tt)*) => {
         $(#[$attrs])*
-        #[allow(clippy::missing_safety_doc)]
         $v unsafe fn $name($($args:$args_ty),*) -> ! {
             #[link(wasm_import_module = $module)]
             extern "C" {

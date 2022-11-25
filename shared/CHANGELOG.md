@@ -1,77 +1,36 @@
 # Changelog
 
-## [Unreleased]
+## 2.0.0 [2022-10-12]
 
-- ...
+No change.
 
-## 3.0.0-alpha.12 [2022-11-17]
+## 2.0.0-alpha.4 [2022-09-12]
 
-- Refactor network/message contexts to reduce the number of syscalls.
+- Add nv17 to network version list (non-breaking).
+- Allow constructing a token amount from whole "bigints".
 
-## 3.0.0-alpha.11 [2022-11-15]
+## 2.0.0-alpha.3 [2022-08-31]
 
-- Add support for actor events (FIP-0049).
+- Add even more math operations to TokenAmount.
+- Add a Sum method to TokenAmount.
 
-## 3.0.0-alpha.10 [2022-11-14]
+## 2.0.0-alpha.2 [2022-08-29]
 
-- Split `InvokeContext` into two (#1070)
-- fix: correctly format negative token amounts (#1065)
+- Add additional math operations to TokenAmount.
 
-## 3.0.0-alpha.9 [2022-11-08]
-
-- Add support for state-tree v5.
-
-## 3.0.0-alpha.8 [2022-10-22]
-
-- fix compile issues with f4-as-account feature.
-
-## 3.0.0-alpha.7 [2022-10-21]
-
-- Temporary workaround: allow validating signatures from embryo f4 addresses
-
-## 3.0.0-alpha.6 [2022-10-20]
-
-- Make the f4 address conform to FIP0048 (use `f` as the separator).
-- Implement `TryFrom<Payload>` for `DelegatedAddress` (and make `DelegatedAddress` public).
-
-## 3.0.0-alpha.5 [2022-10-10]
-
-- Bumps `fvm_ipld_encoding` and switches from `cs_serde_bytes` to `fvm_ipld_encoding::strict_bytes`.
-
-## 3.0.0-alpha.4 [2022-10-10]
-
-- Small f4 address fixes.
-
-## 3.0.0-alpha.3 [2022-10-10]
-
-- Switch to rust 2021 edition.
-- Add network version 18.
-- BREAKING: Allow changing the address "network" at runtime.
-- BREAKING: Update the f4 address format and include a checksum.
-- BREAKING: Add the gas premium and gas limit to the `vm::context` return type.
-
-## 3.0.0-alpha.2 [2022-09-16]
-
-- Add basic f4 address support (without checksums for now).
-- Change TokenAmount::from_whole to take any `Into<BigInt>` parameter.
-- Add nv17 to the network versions.
-
-The only breaking change is the change to `Address`/`Protocol` (in case anyone is exhaustively matching on them).
-
-## 3.0.0-alpha.1 [2022-08-31]
-
-- Bump base version to v3.
-- Add `origin` to `vm::Context`.
-
-## 2.0.0...
-
-See the `release/v2` branch.
+## 2.0.0-alpha.1 [2022-08-29]
 
 - Add recover secp public key syscall.
 - Removed `actor::builtin::Type` (moved to the actors themselves).
 - Add additional hash functions to the hash syscall.
 - Add blake2b512
 - Change TokenAmount from a type alias to a struct wrapping BigInt
+
+(lots of breaking changes)
+
+## 0.9.0
+
+- Update proofs.
 
 ## 0.8.0 [2022-06-13]
 

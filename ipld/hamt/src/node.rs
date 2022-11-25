@@ -16,7 +16,6 @@ use super::bitfield::Bitfield;
 use super::hash_bits::HashBits;
 use super::pointer::Pointer;
 use super::{Error, Hash, HashAlgorithm, KeyValuePair, MAX_ARRAY_WIDTH};
-use crate::Config;
 
 /// Node in Hamt tree which contains bitfield of set indexes and pointers to nodes
 #[derive(Debug)]
@@ -84,7 +83,7 @@ where
         key: K,
         value: V,
         store: &S,
-        conf: &Config,
+        bit_width: u32,
         overwrite: bool,
     ) -> Result<(Option<V>, bool), Error>
     where
@@ -93,7 +92,8 @@ where
         let hash = H::hash(&key);
         self.modify_value(
             &mut HashBits::new(&hash),
-            conf,
+            bit_width,
+            0,
             key,
             value,
             store,
@@ -106,13 +106,13 @@ where
         &self,
         k: &Q,
         store: &S,
-        conf: &Config,
+        bit_width: u32,
     ) -> Result<Option<&V>, Error>
     where
         K: Borrow<Q>,
         Q: Eq + Hash,
     {
-        Ok(self.search(k, store, conf)?.map(|kv| kv.value()))
+        Ok(self.search(k, store, bit_width)?.map(|kv| kv.value()))
     }
 
     #[inline]
@@ -120,7 +120,7 @@ where
         &mut self,
         k: &Q,
         store: &S,
-        conf: &Config,
+        bit_width: u32,
     ) -> Result<Option<(K, V)>, Error>
     where
         K: Borrow<Q>,
@@ -128,7 +128,7 @@ where
         S: Blockstore,
     {
         let hash = H::hash(k);
-        self.rm_value(&mut HashBits::new(&hash), conf, k, store)
+        self.rm_value(&mut HashBits::new(&hash), bit_width, 0, k, store)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -161,7 +161,7 @@ where
                         cache_node.for_each(store, f)?
                     }
                 }
-                Pointer::Dirty(node) => node.for_each(store, f)?,
+                Pointer::Dirty(n) => n.for_each(store, f)?,
                 Pointer::Values(kvs) => {
                     for kv in kvs {
                         f(kv.0.borrow(), kv.1.borrow())?;
@@ -177,20 +177,21 @@ where
         &self,
         q: &Q,
         store: &S,
-        conf: &Config,
+        bit_width: u32,
     ) -> Result<Option<&KeyValuePair<K, V>>, Error>
     where
         K: Borrow<Q>,
         Q: Eq + Hash,
     {
         let hash = H::hash(q);
-        self.get_value(&mut HashBits::new(&hash), conf, q, store)
+        self.get_value(&mut HashBits::new(&hash), bit_width, 0, q, store)
     }
 
     fn get_value<Q: ?Sized, S: Blockstore>(
         &self,
         hashed_key: &mut HashBits,
-        conf: &Config,
+        bit_width: u32,
+        depth: u64,
         key: &Q,
         store: &S,
     ) -> Result<Option<&KeyValuePair<K, V>>, Error>
@@ -198,7 +199,7 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash,
     {
-        let idx = hashed_key.next(conf.bit_width)?;
+        let idx = hashed_key.next(bit_width)?;
 
         if !self.bitfield.test_bit(idx) {
             return Ok(None);
@@ -206,12 +207,11 @@ where
 
         let cindex = self.index_for_bit_pos(idx);
         let child = self.get_child(cindex);
-
-        let node = match child {
+        match child {
             Pointer::Link { cid, cache } => {
                 if let Some(cached_node) = cache.get() {
                     // Link node is cached
-                    cached_node
+                    cached_node.get_value(hashed_key, bit_width, depth + 1, key, store)
                 } else {
                     let node: Box<Node<K, V, H>> = if let Some(node) = store.get_cbor(cid)? {
                         node
@@ -222,29 +222,24 @@ where
                         #[cfg(feature = "ignore-dead-links")]
                         return Ok(None);
                     };
+
                     // Intentionally ignoring error, cache will always be the same.
-                    cache.get_or_init(|| node)
+                    let cache_node = cache.get_or_init(|| node);
+                    cache_node.get_value(hashed_key, bit_width, depth + 1, key, store)
                 }
             }
-            Pointer::Dirty(node) => node,
-            Pointer::Values(vals) => {
-                return Ok(vals.iter().find(|kv| key.eq(kv.key().borrow())));
-            }
-        };
-
-        node.get_value(hashed_key, conf, key, store)
+            Pointer::Dirty(n) => n.get_value(hashed_key, bit_width, depth + 1, key, store),
+            Pointer::Values(vals) => Ok(vals.iter().find(|kv| key.eq(kv.key().borrow()))),
+        }
     }
 
     /// Internal method to modify values.
-    ///
-    /// Returns the a tuple with:
-    /// * the old data at this key, if any
-    /// * whether the data has been modified
     #[allow(clippy::too_many_arguments)]
     fn modify_value<S: Blockstore>(
         &mut self,
         hashed_key: &mut HashBits,
-        conf: &Config,
+        bit_width: u32,
+        depth: u64,
         key: K,
         value: V,
         store: &S,
@@ -253,7 +248,7 @@ where
     where
         V: PartialEq,
     {
-        let idx = hashed_key.next(conf.bit_width)?;
+        let idx = hashed_key.next(bit_width)?;
 
         // No existing values at this point.
         if !self.bitfield.test_bit(idx) {
@@ -273,16 +268,29 @@ where
                 })?;
                 let child_node = cache.get_mut().expect("filled line above");
 
-                let (old, modified) =
-                    child_node.modify_value(hashed_key, conf, key, value, store, overwrite)?;
+                let (old, modified) = child_node.modify_value(
+                    hashed_key,
+                    bit_width,
+                    depth + 1,
+                    key,
+                    value,
+                    store,
+                    overwrite,
+                )?;
                 if modified {
                     *child = Pointer::Dirty(std::mem::take(child_node));
                 }
                 Ok((old, modified))
             }
-            Pointer::Dirty(node) => {
-                node.modify_value(hashed_key, conf, key, value, store, overwrite)
-            }
+            Pointer::Dirty(n) => Ok(n.modify_value(
+                hashed_key,
+                bit_width,
+                depth + 1,
+                key,
+                value,
+                store,
+                overwrite,
+            )?),
             Pointer::Values(vals) => {
                 // Update, if the key already exists.
                 if let Some(i) = vals.iter().position(|p| p.key() == &key) {
@@ -306,23 +314,26 @@ where
 
                 // If the array is full, create a subshard and insert everything
                 if vals.len() >= MAX_ARRAY_WIDTH {
-                    let kvs = std::mem::take(vals);
-                    let hashed_kvs = kvs.into_iter().map(|KeyValuePair(k, v)| {
-                        let hash = H::hash(&k);
-                        (k, v, hash)
-                    });
-
-                    let consumed = hashed_key.consumed;
                     let mut sub = Node::<K, V, H>::default();
-                    let modified =
-                        sub.modify_value(hashed_key, conf, key, value, store, overwrite)?;
-
-                    for (k, v, hash) in hashed_kvs {
+                    let consumed = hashed_key.consumed;
+                    let modified = sub.modify_value(
+                        hashed_key,
+                        bit_width,
+                        depth + 1,
+                        key,
+                        value,
+                        store,
+                        overwrite,
+                    )?;
+                    let kvs = std::mem::take(vals);
+                    for p in kvs.into_iter() {
+                        let hash = H::hash(p.key());
                         sub.modify_value(
                             &mut HashBits::new_at_index(&hash, consumed),
-                            conf,
-                            k,
-                            v,
+                            bit_width,
+                            depth + 1,
+                            p.0,
+                            p.1,
                             store,
                             overwrite,
                         )?;
@@ -349,7 +360,8 @@ where
     fn rm_value<Q: ?Sized, S: Blockstore>(
         &mut self,
         hashed_key: &mut HashBits,
-        conf: &Config,
+        bit_width: u32,
+        depth: u64,
         key: &Q,
         store: &S,
     ) -> Result<Option<(K, V)>, Error>
@@ -357,7 +369,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let idx = hashed_key.next(conf.bit_width)?;
+        let idx = hashed_key.next(bit_width)?;
 
         // No existing values at this point.
         if !self.bitfield.test_bit(idx) {
@@ -376,8 +388,7 @@ where
                 })?;
                 let child_node = cache.get_mut().expect("filled line above");
 
-                let deleted = child_node.rm_value(hashed_key, conf, key, store)?;
-
+                let deleted = child_node.rm_value(hashed_key, bit_width, depth + 1, key, store)?;
                 if deleted.is_some() {
                     *child = Pointer::Dirty(std::mem::take(child_node));
                     // Clean to retrieve canonical form
@@ -386,15 +397,12 @@ where
 
                 Ok(deleted)
             }
-            Pointer::Dirty(node) => {
+            Pointer::Dirty(n) => {
                 // Delete value and return deleted value
-                let deleted = node.rm_value(hashed_key, conf, key, store)?;
+                let deleted = n.rm_value(hashed_key, bit_width, depth + 1, key, store)?;
 
-                if deleted.is_some() {
-                    // Clean to ensure canonical form
-                    child.clean()?;
-                }
-
+                // Clean to ensure canonical form
+                child.clean()?;
                 Ok(deleted)
             }
             Pointer::Values(vals) => {

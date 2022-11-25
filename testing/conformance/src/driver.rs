@@ -19,18 +19,12 @@ use regex::Regex;
 use walkdir::DirEntry;
 
 use crate::vector::{MessageVector, Variant};
-use crate::vm::{TestKernel, TestMachine, TestStatsRef};
+use crate::vm::{TestKernel, TestMachine};
 
 lazy_static! {
     static ref SKIP_TESTS: Vec<Regex> = vec![
-        // TestMachine::import_actors no longer loads V6 bundle required for NetworkVersion 15
-        ".*/specs_actors_v6/.*",
-        ".*/fil_6_.*",
-        // SYS_FORBIDDEN instead of USR_FORBIDDEN. Fixed in newer versions.
-        ".*/specs_actors_v7/TestAggregateBadSender/6f9aa4df047387cdb61f7328f3697c99e53d6151045880902595ca1ac60d334e.*",
-        // USR_ILLEGAL_ARGUMENT instead of USR_NOT_FOUND. Not sure why; disabled so other errors can be seen in CI.
-        ".*/specs_actors_v7/TestWrongPartitionIndexFailure/b4e5b1bb610305fc8cf81bfb859c76b9acdacb109a591354e7a6b43bb8e7b61f.*",
-    ].into_iter().map(|re| Regex::new(re).unwrap()).collect();
+        // currently empty.
+    ];
 }
 
 /// Checks if the file is a runnable vector.
@@ -145,22 +139,22 @@ fn compare_state_roots(bs: &MemoryBlockstore, root: &Cid, vector: &MessageVector
 
     for m in &vector.apply_messages {
         let msg = Message::unmarshal_cbor(&m.bytes)?;
-        let actual_actor = actual_st.get_actor_by_address(&msg.from)?;
-        let expected_actor = expected_st.get_actor_by_address(&msg.from)?;
+        let actual_actor = actual_st.get_actor(&msg.from)?;
+        let expected_actor = expected_st.get_actor(&msg.from)?;
         compare_actors(bs, "sender", actual_actor, expected_actor)?;
 
-        let actual_actor = actual_st.get_actor_by_address(&msg.to)?;
-        let expected_actor = expected_st.get_actor_by_address(&msg.to)?;
+        let actual_actor = actual_st.get_actor(&msg.to)?;
+        let expected_actor = expected_st.get_actor(&msg.to)?;
         compare_actors(bs, "receiver", actual_actor, expected_actor)?;
     }
 
     // All system actors
     for id in 0..100 {
-        let expected_actor = match expected_st.get_actor(id) {
+        let expected_actor = match expected_st.get_actor_id(id) {
             Ok(act) => act,
             Err(_) => continue, // we don't expect it anyways.
         };
-        let actual_actor = actual_st.get_actor(id)?;
+        let actual_actor = actual_st.get_actor_id(id)?;
         compare_actors(
             bs,
             format_args!("builtin {}", id),
@@ -169,11 +163,11 @@ fn compare_state_roots(bs: &MemoryBlockstore, root: &Cid, vector: &MessageVector
         )?;
     }
 
-    Err(anyhow!(
+    return Err(anyhow!(
         "wrong post root cid; expected {}, but got {}",
         &vector.postconditions.state_tree.root_cid,
         root
-    ))
+    ));
 }
 
 /// Represents the result from running a vector.
@@ -192,12 +186,11 @@ pub fn run_variant(
     variant: &Variant,
     engines: &MultiEngine,
     check_correctness: bool,
-    stats: TestStatsRef,
 ) -> anyhow::Result<VariantResult> {
     let id = variant.id.clone();
 
     // Construct the Machine.
-    let machine = TestMachine::new_for_vector(v, variant, bs, engines, stats)?;
+    let machine = TestMachine::new_for_vector(v, variant, bs, engines);
     let mut exec: DefaultExecutor<TestKernel> = DefaultExecutor::new(machine);
 
     // Apply all messages in the vector.

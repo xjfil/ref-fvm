@@ -24,7 +24,7 @@ use fvm_shared::{ActorID, HAMT_BIT_WIDTH};
 
 use crate::state_tree::{ActorState, StateTree};
 
-pub const INIT_ACTOR_ID: ActorID = 1;
+pub const INIT_ACTOR_ADDR: Address = Address::new_id(1);
 
 use crate::kernel::{ClassifyResult, Result};
 
@@ -33,45 +33,18 @@ pub struct State {
     pub address_map: Cid,
     pub next_id: ActorID,
     pub network_name: String,
-    #[cfg(feature = "m2-native")]
-    pub installed_actors: Cid,
 }
 
 impl Cbor for State {}
 
 impl State {
-    // ideally we would just #[cfg(test)] this, but it is used by non test-gated code in
-    // integration/tester.
-    #[allow(unused)]
-    pub fn new_test<B: Blockstore>(store: &B) -> Self {
-        #[cfg(feature = "m2-native")]
-        use cid::multihash::Code::Blake2b256;
-
-        // Empty hamt Cid used for testing
-        let e_cid = Hamt::<_, String>::new_with_bit_width(&store, 5)
-            .flush()
-            .unwrap();
-
-        // Empty list Cid used for testing
-        #[cfg(feature = "m2-native")]
-        let el_cid = store.put_cbor(&Vec::<Cid>::new(), Blake2b256).unwrap();
-
-        State {
-            address_map: e_cid,
-            next_id: 100,
-            network_name: "test".to_owned(),
-            #[cfg(feature = "m2-native")]
-            installed_actors: el_cid,
-        }
-    }
-
     /// Loads the init actor state from the supplied state tree.
     pub fn load<B>(state_tree: &StateTree<B>) -> Result<(Self, ActorState)>
     where
         B: Blockstore,
     {
         let init_act = state_tree
-            .get_actor(INIT_ACTOR_ID)?
+            .get_actor(&INIT_ACTOR_ADDR)?
             .context("init actor address could not be resolved")
             .or_fatal()?;
 
@@ -123,13 +96,8 @@ impl State {
         }
 
         let map = Hamt::<B, _>::load_with_bit_width(&self.address_map, store, HAMT_BIT_WIDTH)
-            .context("failed to load init actor address map")
             .or_fatal()?;
 
-        Ok(map
-            .get(&addr.to_bytes())
-            .context("failed to read init actor address map")
-            .or_fatal()?
-            .copied())
+        Ok(map.get(&addr.to_bytes()).or_fatal()?.copied())
     }
 }

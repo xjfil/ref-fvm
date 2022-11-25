@@ -1,7 +1,6 @@
 use cid::Cid;
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
-use fvm_shared::event::StampedEvent;
 use fvm_shared::ActorID;
 
 use super::{Engine, Machine, MachineContext, Manifest};
@@ -13,56 +12,50 @@ type Type = MachineContext;
 impl<M: Machine> Machine for Box<M> {
     type Blockstore = M::Blockstore;
     type Externs = M::Externs;
-    type Limiter = M::Limiter;
 
     #[inline(always)]
     fn engine(&self) -> &Engine {
-        (**self).engine()
+        (&**self).engine()
     }
 
     #[inline(always)]
     fn blockstore(&self) -> &Self::Blockstore {
-        (**self).blockstore()
+        (&**self).blockstore()
     }
 
     #[inline(always)]
     fn context(&self) -> &Type {
-        (**self).context()
+        (&**self).context()
     }
 
     #[inline(always)]
     fn externs(&self) -> &Self::Externs {
-        (**self).externs()
+        (&**self).externs()
     }
 
     #[inline(always)]
     fn builtin_actors(&self) -> &Manifest {
-        (**self).builtin_actors()
+        (&**self).builtin_actors()
     }
 
     #[inline(always)]
     fn state_tree(&self) -> &StateTree<Self::Blockstore> {
-        (**self).state_tree()
+        (&**self).state_tree()
     }
 
     #[inline(always)]
     fn state_tree_mut(&mut self) -> &mut StateTree<Self::Blockstore> {
-        (**self).state_tree_mut()
+        (&mut **self).state_tree_mut()
     }
 
     #[inline(always)]
     fn create_actor(&mut self, addr: &Address, act: ActorState) -> Result<ActorID> {
-        (**self).create_actor(addr, act)
+        (&mut **self).create_actor(addr, act)
     }
 
     #[inline(always)]
     fn transfer(&mut self, from: ActorID, to: ActorID, value: &TokenAmount) -> Result<()> {
-        (**self).transfer(from, to, value)
-    }
-
-    #[inline(always)]
-    fn flush(&mut self) -> Result<Cid> {
-        (**self).flush()
+        (&mut **self).transfer(from, to, value)
     }
 
     #[inline(always)]
@@ -71,17 +64,12 @@ impl<M: Machine> Machine for Box<M> {
     }
 
     #[inline(always)]
+    fn flush(&mut self) -> Result<Cid> {
+        (**self).flush()
+    }
+
+    #[inline(always)]
     fn machine_id(&self) -> &str {
-        (**self).machine_id()
-    }
-
-    #[inline(always)]
-    fn new_limiter(&self) -> Self::Limiter {
-        (**self).new_limiter()
-    }
-
-    #[inline(always)]
-    fn commit_events(&self, events: &[StampedEvent]) -> Result<Option<Cid>> {
-        (**self).commit_events(events)
+        (&**self).machine_id()
     }
 }

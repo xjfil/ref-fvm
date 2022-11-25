@@ -2,13 +2,11 @@ use std::ops::RangeInclusive;
 
 use anyhow::{anyhow, Context as _};
 use cid::Cid;
-use fvm_ipld_amt::Amt;
 use fvm_ipld_blockstore::{Blockstore, Buffered};
 use fvm_ipld_encoding::CborStore;
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ErrorNumber;
-use fvm_shared::event::StampedEvent;
 use fvm_shared::version::NetworkVersion;
 use fvm_shared::ActorID;
 use log::debug;
@@ -16,16 +14,11 @@ use log::debug;
 use super::{Engine, Machine, MachineContext};
 use crate::blockstore::BufferedBlockstore;
 use crate::externs::Externs;
-#[cfg(feature = "m2-native")]
-use crate::init_actor::State as InitActorState;
-use crate::kernel::{ClassifyResult, Result};
-use crate::machine::limiter::ExecResourceLimiter;
+use crate::kernel::{ClassifyResult, Context as _, Result};
 use crate::machine::Manifest;
 use crate::state_tree::{ActorState, StateTree};
 use crate::syscall_error;
 use crate::system_actor::State as SystemActorState;
-
-pub const EVENTS_AMT_BITWIDTH: u32 = 5;
 
 pub struct DefaultMachine<B, E> {
     /// The initial execution context for this epoch.
@@ -69,7 +62,7 @@ where
         externs: E,
     ) -> anyhow::Result<Self> {
         const SUPPORTED_VERSIONS: RangeInclusive<NetworkVersion> =
-            NetworkVersion::V18..=NetworkVersion::V18;
+            NetworkVersion::V15..=NetworkVersion::V17;
 
         debug!(
             "initializing a new machine, epoch={}, base_fee={}, nv={:?}, root={}",
@@ -126,21 +119,6 @@ where
         #[cfg(not(any(test, feature = "testing")))]
         engine.preload(state_tree.store(), builtin_actors.builtin_actor_codes())?;
 
-        #[cfg(feature = "m2-native")]
-        {
-            // preload user actors that have been installed
-            // TODO This must be revisited when implementing the actively managed cache.
-            // Doesn't need the m2-native feature guard because there's no possiblity
-            // for user code to install new actors if that feature is disabled anyway
-            // (so this would be a no-op). We could add the guard as an optimization, though.
-            let (init_state, _) = InitActorState::load(&state_tree)?;
-            let installed_actors: Vec<Cid> = state_tree
-                .store()
-                .get_cbor(&init_state.installed_actors)?
-                .context("failed to load installed actor list")?;
-            engine.preload(state_tree.store(), &installed_actors)?;
-        }
-
         // 16 bytes is random _enough_
         let randomness: [u8; 16] = rand::random();
 
@@ -153,7 +131,7 @@ where
             id: format!(
                 "{}-{}",
                 context.epoch,
-                cid::multibase::encode(cid::multibase::Base::Base32Lower, randomness)
+                cid::multibase::encode(cid::multibase::Base::Base32Lower, &randomness)
             ),
         })
     }
@@ -166,7 +144,6 @@ where
 {
     type Blockstore = BufferedBlockstore<B>;
     type Externs = E;
-    type Limiter = ExecResourceLimiter;
 
     fn engine(&self) -> &Engine {
         &self.engine
@@ -211,9 +188,15 @@ where
     fn create_actor(&mut self, addr: &Address, act: ActorState) -> Result<ActorID> {
         let state_tree = self.state_tree_mut();
 
-        let addr_id = state_tree.register_new_address(addr)?;
+        let addr_id = state_tree
+            .register_new_address(addr)
+            .context("failed to register new address")
+            .or_fatal()?;
 
-        state_tree.set_actor(addr_id, act)?;
+        state_tree
+            .set_actor(&Address::new_id(addr_id), act)
+            .context("failed to set actor")
+            .or_fatal()?;
         Ok(addr_id)
     }
 
@@ -228,7 +211,7 @@ where
         // that and the case where the _receiving_ actor doesn't exist.
         let mut from_actor = self
             .state_tree
-            .get_actor(from)?
+            .get_actor_id(from)?
             .context("cannot transfer from non-existent sender")
             .or_error(ErrorNumber::InsufficientFunds)?;
 
@@ -243,46 +226,19 @@ where
 
         let mut to_actor = self
             .state_tree
-            .get_actor(to)?
+            .get_actor_id(to)?
             .context("cannot transfer to non-existent receiver")
             .or_error(ErrorNumber::NotFound)?;
 
         from_actor.deduct_funds(value)?;
         to_actor.deposit_funds(value);
 
-        self.state_tree.set_actor(from, from_actor)?;
-        self.state_tree.set_actor(to, to_actor)?;
+        self.state_tree.set_actor_id(from, from_actor)?;
+        self.state_tree.set_actor_id(to, to_actor)?;
 
         log::trace!("transferred {} from {} to {}", value, from, to);
 
         Ok(())
-    }
-
-    fn commit_events(&self, events: &[StampedEvent]) -> Result<Option<Cid>> {
-        if events.is_empty() {
-            return Ok(None);
-        }
-
-        let blockstore = self.blockstore();
-
-        let amt_cid = {
-            let mut amt = Amt::new_with_bit_width(blockstore, EVENTS_AMT_BITWIDTH);
-            // TODO this can be zero-copy if the AMT supports a batch set operation that takes an
-            //  iterator of references and flushes the batch at the end.
-            amt.batch_set(events.iter().cloned())
-                .context("failed to add events to AMT")
-                .or_fatal()?;
-            amt.flush()
-                .context("failed to flush events AMT")
-                .or_fatal()?
-        };
-
-        blockstore
-            .flush(&amt_cid)
-            .context("failed to flush the events AMT root CID through the buffered store")
-            .or_fatal()?;
-
-        Ok(Some(amt_cid))
     }
 
     fn into_store(self) -> Self::Blockstore {
@@ -291,9 +247,5 @@ where
 
     fn machine_id(&self) -> &str {
         &self.id
-    }
-
-    fn new_limiter(&self) -> Self::Limiter {
-        ExecResourceLimiter::for_network(&self.context().network)
     }
 }

@@ -1,4 +1,3 @@
-use fil_malformed_syscall_actor::WASM_BINARY as MALFORMED_ACTOR_BINARY;
 use fvm::call_manager::backtrace::Cause;
 use fvm::executor::{ApplyFailure, ApplyKind, Executor};
 use fvm_integration_tests::dummy::DummyExterns;
@@ -13,6 +12,7 @@ use fvm_shared::message::Message;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
 use num_traits::Zero;
+use wabt::wat2wasm;
 
 mod bundles;
 use bundles::*;
@@ -31,6 +31,9 @@ const WAT_UNKNOWN_SYSCALL: &str = r#"
         (global $__heap_base (export "__heap_base") i32 (i32.const 1048576)))
     "#;
 
+const WASM_COMPILED_PATH: &str =
+    "../../target/debug/wbuild/fil_malformed_syscall_actor/fil_malformed_syscall_actor.compact.wasm";
+
 #[derive(Serialize_tuple, Deserialize_tuple, Clone, Debug, Default)]
 pub struct State {
     pub count: i64,
@@ -42,8 +45,8 @@ fn instantiate_tester(
 ) -> (Account, Tester<MemoryBlockstore, DummyExterns>, Address) {
     // Instantiate tester
     let mut tester = new_tester(
-        NetworkVersion::V18,
-        StateTreeVersion::V5,
+        NetworkVersion::V15,
+        StateTreeVersion::V4,
         MemoryBlockstore::default(),
     )
     .unwrap();
@@ -67,7 +70,7 @@ fn instantiate_tester(
 #[test]
 fn non_existing_syscall() {
     // Get wasm bin
-    let wasm_bin = wat::parse_str(WAT_UNKNOWN_SYSCALL).unwrap();
+    let wasm_bin = wat2wasm(WAT_UNKNOWN_SYSCALL).unwrap();
 
     // Instantiate tester
     let (sender, mut tester, actor_address) = instantiate_tester(&wasm_bin);
@@ -123,10 +126,16 @@ fn non_existing_syscall() {
 #[test]
 fn malformed_syscall_parameter() {
     // Get wasm bin
-    let wasm_bin = MALFORMED_ACTOR_BINARY.unwrap();
+    let wasm_path = std::env::current_dir()
+        .unwrap()
+        .join(WASM_COMPILED_PATH)
+        .canonicalize()
+        .unwrap();
+
+    let wasm_bin = std::fs::read(wasm_path).expect("Unable to read file");
 
     // Instantiate tester
-    let (sender, mut tester, actor_address) = instantiate_tester(wasm_bin);
+    let (sender, mut tester, actor_address) = instantiate_tester(&wasm_bin);
 
     // Instantiate machine
     tester.instantiate_machine(DummyExterns).unwrap();

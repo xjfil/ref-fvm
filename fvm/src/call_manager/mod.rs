@@ -1,4 +1,3 @@
-use cid::Cid;
 use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::ExitCode;
@@ -11,12 +10,12 @@ use crate::state_tree::StateTree;
 use crate::Kernel;
 
 pub mod backtrace;
+
 pub use backtrace::Backtrace;
 
 mod default;
 
 pub use default::DefaultCallManager;
-use fvm_shared::event::StampedEvent;
 
 use crate::trace::ExecutionTrace;
 
@@ -43,14 +42,7 @@ pub trait CallManager: 'static {
     type Machine: Machine;
 
     /// Construct a new call manager.
-    fn new(
-        machine: Self::Machine,
-        gas_limit: i64,
-        origin: ActorID,
-        origin_address: Address,
-        nonce: u64,
-        gas_premium: TokenAmount,
-    ) -> Self;
+    fn new(machine: Self::Machine, gas_limit: i64, origin: Address, nonce: u64) -> Self;
 
     /// Send a message. The type parameter `K` specifies the the _kernel_ on top of which the target
     /// actor should execute.
@@ -77,32 +69,19 @@ pub trait CallManager: 'static {
     /// Returns a mutable reference to the machine.
     fn machine_mut(&mut self) -> &mut Self::Machine;
 
-    /// Returns a reference to the gas tracker.
+    /// Returns reference to the gas tracker.
     fn gas_tracker(&self) -> &GasTracker;
-
-    /// Returns the gas premium paid by the currently executing message.
-    fn gas_premium(&self) -> &TokenAmount;
+    /// Returns a mutable reference to the gas tracker.
+    fn gas_tracker_mut(&mut self) -> &mut GasTracker;
 
     /// Getter for origin actor.
-    fn origin(&self) -> ActorID;
-
-    /// Get the actor address (f2) that will should be assigned to the next actor created.
-    ///
-    /// This method doesn't have any side-effects and will continue to return the same address until
-    /// `create_actor` is called next.
-    fn next_actor_address(&self) -> Address;
-
-    /// Create a new actor with the given code CID, actor ID, and predictable address. This method
-    /// does not register the actor with the init actor. It just creates it in the state-tree.
-    fn create_actor(
-        &mut self,
-        code_id: Cid,
-        actor_id: ActorID,
-        predictable_address: Option<Address>,
-    ) -> Result<()>;
+    fn origin(&self) -> Address;
 
     /// Getter for message nonce.
     fn nonce(&self) -> u64;
+
+    /// Gets and increment the call-stack actor creation index.
+    fn next_actor_idx(&mut self) -> u64;
 
     /// Gets the total invocations done on this call stack.
     fn invocation_count(&self) -> u64;
@@ -138,32 +117,34 @@ pub trait CallManager: 'static {
     }
 
     /// Charge gas.
-    fn charge_gas(&self, charge: GasCharge) -> Result<()> {
-        self.gas_tracker().apply_charge(charge)?;
+    fn charge_gas(&mut self, charge: GasCharge) -> Result<()> {
+        self.gas_tracker_mut().apply_charge(charge)?;
         Ok(())
     }
-
-    /// Limit memory usage throughout a message execution.
-    fn limiter_mut(&mut self) -> &mut <Self::Machine as Machine>::Limiter;
-
-    /// Appends an event to the event accumulator.
-    fn append_event(&mut self, evt: StampedEvent);
 }
 
 /// The result of a method invocation.
 #[derive(Clone, Debug)]
-pub struct InvocationResult {
-    /// The exit code (0 for success).
-    pub exit_code: ExitCode,
-    /// The return value, if any.
-    pub value: Option<kernel::Block>,
+pub enum InvocationResult {
+    /// Indicates that the actor successfully returned. The value may be empty.
+    Return(Option<kernel::Block>),
+    /// Indicates that the actor aborted with the given exit code.
+    Failure(ExitCode),
 }
 
 impl Default for InvocationResult {
     fn default() -> Self {
-        Self {
-            value: None,
-            exit_code: ExitCode::OK,
+        Self::Return(Default::default())
+    }
+}
+
+impl InvocationResult {
+    /// Get the exit code for the invocation result. [`ExitCode::Ok`] on success, or the exit code
+    /// from the [`Failure`](InvocationResult::Failure) variant otherwise.
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Return(_) => ExitCode::OK,
+            Self::Failure(e) => *e,
         }
     }
 }
@@ -173,5 +154,4 @@ pub struct FinishRet {
     pub gas_used: i64,
     pub backtrace: Backtrace,
     pub exec_trace: ExecutionTrace,
-    pub events: Vec<StampedEvent>,
 }

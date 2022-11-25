@@ -4,29 +4,26 @@ use std::result::Result as StdResult;
 use anyhow::{anyhow, Result};
 use cid::Cid;
 use fvm_ipld_encoding::{RawBytes, DAG_CBOR};
-#[cfg(feature = "f4-as-account")]
-use fvm_shared::address::Payload;
+use fvm_shared::address::Address;
 use fvm_shared::econ::TokenAmount;
 use fvm_shared::error::{ErrorNumber, ExitCode};
-use fvm_shared::event::StampedEvent;
 use fvm_shared::message::Message;
 use fvm_shared::receipt::Receipt;
 use fvm_shared::ActorID;
 use num_traits::Zero;
 
 use super::{ApplyFailure, ApplyKind, ApplyRet, Executor};
-use crate::call_manager::{backtrace, Backtrace, CallManager, InvocationResult};
+use crate::call_manager::{backtrace, CallManager, InvocationResult};
 use crate::gas::{Gas, GasCharge, GasOutputs};
 use crate::kernel::{Block, ClassifyResult, Context as _, ExecutionError, Kernel};
-use crate::machine::{Machine, BURNT_FUNDS_ACTOR_ID, REWARD_ACTOR_ID};
-use crate::trace::ExecutionTrace;
+use crate::machine::{Machine, BURNT_FUNDS_ACTOR_ADDR, REWARD_ACTOR_ADDR};
 
 /// The default [`Executor`].
 ///
 /// # Warning
 ///
 /// Message execution might run out of stack and crash (the entire process) if it doesn't have at
-/// least 64MiB of stack space. If you can't guarantee 64MiB of stack space, wrap this executor in
+/// least 64MiB of stacks space. If you can't guarantee 64MiB of stack space, wrap this executor in
 /// a [`ThreadedExecutor`][super::ThreadedExecutor].
 // If the inner value is `None` it means the machine got poisoned and is unusable.
 #[repr(transparent)]
@@ -36,7 +33,7 @@ impl<K: Kernel> Deref for DefaultExecutor<K> {
     type Target = <K::CallManager as CallManager>::Machine;
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("machine poisoned")
+        &*self.0.as_ref().expect("machine poisoned")
     }
 }
 
@@ -66,26 +63,9 @@ where
                 Err(apply_ret) => return Ok(apply_ret),
             };
 
-        struct MachineExecRet {
-            result: crate::kernel::error::Result<InvocationResult>,
-            gas_used: i64,
-            backtrace: Backtrace,
-            exec_trace: ExecutionTrace,
-            events_root: Option<Cid>,
-            events: Vec<StampedEvent>, // TODO consider removing if nothing in the client ends up using it.
-        }
-
         // Apply the message.
-        let ret = self.map_machine(|machine| {
-            // We're processing a chain message, so the sender is the origin of the call stack.
-            let mut cm = K::CallManager::new(
-                machine,
-                msg.gas_limit,
-                sender_id,
-                msg.from,
-                msg.sequence,
-                msg.gas_premium.clone(),
-            );
+        let (res, gas_used, mut backtrace, exec_trace) = self.map_machine(|machine| {
+            let mut cm = K::CallManager::new(machine, msg.gas_limit, msg.from, msg.sequence);
             // This error is fatal because it should have already been accounted for inside
             // preflight_message.
             if let Err(e) = cm.charge_gas(inclusion_cost) {
@@ -103,70 +83,51 @@ where
                 let ret = cm.send::<K>(sender_id, msg.to, msg.method_num, params, &msg.value)?;
 
                 // Charge for including the result (before we end the transaction).
-                if let Some(value) = &ret.value {
-                    cm.charge_gas(
-                        cm.context()
-                            .price_list
-                            .on_chain_return_value(value.size() as usize),
-                    )?;
+                if let InvocationResult::Return(value) = &ret {
+                    cm.charge_gas(cm.context().price_list.on_chain_return_value(
+                        value.as_ref().map(|v| v.size() as usize).unwrap_or(0),
+                    ))?;
                 }
 
                 Ok(ret)
             });
             let (res, machine) = cm.finish();
-
-            // Flush all events to the store.
-            let events_root = match machine.commit_events(res.events.as_slice()) {
-                Ok(cid) => cid,
-                Err(e) => return (Err(e), machine),
-            };
-
             (
-                Ok(MachineExecRet {
-                    result,
-                    gas_used: res.gas_used,
-                    backtrace: res.backtrace,
-                    exec_trace: res.exec_trace,
-                    events_root,
-                    events: res.events,
-                }),
+                Ok((result, res.gas_used, res.backtrace, res.exec_trace)),
                 machine,
             )
         })?;
 
-        let MachineExecRet {
-            result: res,
-            gas_used,
-            mut backtrace,
-            exec_trace,
-            events_root,
-            events,
-        } = ret;
-
         // Extract the exit code and build the result of the message application.
         let receipt = match res {
-            Ok(InvocationResult { exit_code, value }) => {
+            Ok(InvocationResult::Return(return_value)) => {
                 // Convert back into a top-level return "value". We throw away the codec here,
                 // unfortunately.
-                let return_data = value
+                let return_data = return_value
                     .map(|blk| RawBytes::from(blk.data().to_vec()))
                     .unwrap_or_default();
 
+                backtrace.clear();
+                Receipt {
+                    exit_code: ExitCode::OK,
+                    return_data,
+                    gas_used,
+                }
+            }
+            Ok(InvocationResult::Failure(exit_code)) => {
                 if exit_code.is_success() {
-                    backtrace.clear();
+                    return Err(anyhow!("actor failed with status OK"));
                 }
                 Receipt {
                     exit_code,
-                    return_data,
+                    return_data: Default::default(),
                     gas_used,
-                    events_root,
                 }
             }
             Err(ExecutionError::OutOfGas) => Receipt {
                 exit_code: ExitCode::SYS_OUT_OF_GAS,
                 return_data: Default::default(),
                 gas_used,
-                events_root,
             },
             Err(ExecutionError::Syscall(err)) => {
                 // Errors indicate the message couldn't be dispatched at all
@@ -183,7 +144,6 @@ where
                     exit_code,
                     return_data: Default::default(),
                     gas_used,
-                    events_root,
                 }
             }
             Err(ExecutionError::Fatal(err)) => {
@@ -208,7 +168,6 @@ where
                     exit_code: ExitCode::SYS_ASSERTION_FAILED,
                     return_data: Default::default(),
                     gas_used: msg.gas_limit,
-                    events_root,
                 }
             }
         };
@@ -220,15 +179,12 @@ where
         };
 
         match apply_kind {
-            ApplyKind::Explicit => self.finish_message(
-                sender_id,
-                msg,
-                receipt,
-                failure_info,
-                gas_cost,
-                exec_trace,
-                events,
-            ),
+            ApplyKind::Explicit => self
+                .finish_message(msg, receipt, failure_info, gas_cost)
+                .map(|mut apply_ret| {
+                    apply_ret.exec_trace = exec_trace;
+                    apply_ret
+                }),
             ApplyKind::Implicit => Ok(ApplyRet {
                 msg_receipt: receipt,
                 penalty: TokenAmount::zero(),
@@ -240,14 +196,13 @@ where
                 gas_burned: 0,
                 failure_info,
                 exec_trace,
-                events,
             }),
         }
     }
 
     /// Flush the state-tree to the underlying blockstore.
     fn flush(&mut self) -> anyhow::Result<Cid> {
-        let k = (**self).flush()?;
+        let k = (&mut **self).flush()?;
         Ok(k)
     }
 }
@@ -329,7 +284,7 @@ where
 
         let sender = match self
             .state_tree()
-            .get_actor(sender_id)
+            .get_actor(&Address::new_id(sender_id))
             .with_context(|| format!("failed to lookup actor {}", &msg.from))?
         {
             Some(act) => act,
@@ -344,15 +299,6 @@ where
 
         // If sender is not an account actor, the message is invalid.
         let sender_is_account = self.builtin_actors().is_account_actor(&sender.code);
-
-        // Unless we have the f4-as-account hack enabled, and the sender is an embryo created by the EAM.
-        #[cfg(feature = "f4-as-account")]
-        let sender_is_account = sender_is_account
-            || sender
-                .address
-                .map(|a| matches!(a.payload(), Payload::Delegated(da) if da.namespace() == 10 /* eam */))
-                .unwrap_or_default()
-                && self.builtin_actors().is_embryo_actor(&sender.code);
 
         if !sender_is_account {
             return Ok(Err(ApplyRet::prevalidation_fail(
@@ -388,7 +334,7 @@ where
         }
 
         // Deduct message inclusion gas cost and increment sequence.
-        self.state_tree_mut().mutate_actor(sender_id, |act| {
+        self.state_tree_mut().mutate_actor_id(sender_id, |act| {
             act.deduct_funds(&gas_cost)?;
             act.sequence += 1;
             Ok(())
@@ -397,16 +343,12 @@ where
         Ok(Ok((sender_id, gas_cost, inclusion_cost)))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_message(
         &mut self,
-        sender_id: ActorID,
         msg: Message,
         receipt: Receipt,
         failure_info: Option<ApplyFailure>,
         gas_cost: TokenAmount,
-        exec_trace: ExecutionTrace,
-        events: Vec<StampedEvent>,
     ) -> anyhow::Result<ApplyRet> {
         // NOTE: we don't support old network versions in the FVM, so we always burn.
         let GasOutputs {
@@ -425,7 +367,7 @@ where
             &msg.gas_premium,
         );
 
-        let mut transfer_to_actor = |addr: ActorID, amt: &TokenAmount| -> anyhow::Result<()> {
+        let mut transfer_to_actor = |addr: &Address, amt: &TokenAmount| -> anyhow::Result<()> {
             if amt.is_negative() {
                 return Err(anyhow!("attempted to transfer negative value into actor"));
             }
@@ -442,14 +384,14 @@ where
             Ok(())
         };
 
-        transfer_to_actor(BURNT_FUNDS_ACTOR_ID, &base_fee_burn)?;
+        transfer_to_actor(&BURNT_FUNDS_ACTOR_ADDR, &base_fee_burn)?;
 
-        transfer_to_actor(REWARD_ACTOR_ID, &miner_tip)?;
+        transfer_to_actor(&REWARD_ACTOR_ADDR, &miner_tip)?;
 
-        transfer_to_actor(BURNT_FUNDS_ACTOR_ID, &over_estimation_burn)?;
+        transfer_to_actor(&BURNT_FUNDS_ACTOR_ADDR, &over_estimation_burn)?;
 
         // refund unused gas
-        transfer_to_actor(sender_id, &refund)?;
+        transfer_to_actor(&msg.from, &refund)?;
 
         if (&base_fee_burn + &over_estimation_burn + &refund + &miner_tip) != gas_cost {
             // Sanity check. This could be a fatal error.
@@ -465,8 +407,7 @@ where
             gas_refund,
             gas_burned,
             failure_info,
-            exec_trace,
-            events,
+            exec_trace: vec![],
         })
     }
 

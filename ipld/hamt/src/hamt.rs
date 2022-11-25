@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 
 use crate::node::Node;
-use crate::{Config, Error, Hash, HashAlgorithm, Sha256};
+use crate::{Error, Hash, HashAlgorithm, Sha256, DEFAULT_BIT_WIDTH};
 
 /// Implementation of the HAMT data structure for IPLD.
 ///
@@ -35,10 +35,9 @@ use crate::{Config, Error, Hash, HashAlgorithm, Sha256};
 pub struct Hamt<BS, V, K = BytesKey, H = Sha256> {
     root: Node<K, V, H>,
     store: BS,
-    conf: Config,
+
+    bit_width: u32,
     hash: PhantomData<H>,
-    /// Remember the last flushed CID until it changes.
-    flushed_cid: Option<Cid>,
 }
 
 impl<BS, V, K, H> Serialize for Hamt<BS, V, K, H>
@@ -69,54 +68,41 @@ where
     H: HashAlgorithm,
 {
     pub fn new(store: BS) -> Self {
-        Self::new_with_config(store, Config::default())
-    }
-
-    pub fn new_with_config(store: BS, conf: Config) -> Self {
-        Self {
-            root: Node::default(),
-            store,
-            conf,
-            hash: Default::default(),
-            flushed_cid: None,
-        }
+        Self::new_with_bit_width(store, DEFAULT_BIT_WIDTH)
     }
 
     /// Construct hamt with a bit width
     pub fn new_with_bit_width(store: BS, bit_width: u32) -> Self {
-        Self::new_with_config(store, Config { bit_width })
+        Self {
+            root: Node::default(),
+            store,
+            bit_width,
+            hash: Default::default(),
+        }
     }
 
     /// Lazily instantiate a hamt from this root Cid.
     pub fn load(cid: &Cid, store: BS) -> Result<Self, Error> {
-        Self::load_with_config(cid, store, Config::default())
+        Self::load_with_bit_width(cid, store, DEFAULT_BIT_WIDTH)
     }
 
-    /// Lazily instantiate a hamt from this root Cid with a specified parameters.
-    pub fn load_with_config(cid: &Cid, store: BS, conf: Config) -> Result<Self, Error> {
+    /// Lazily instantiate a hamt from this root Cid with a specified bit width.
+    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32) -> Result<Self, Error> {
         match store.get_cbor(cid)? {
             Some(root) => Ok(Self {
                 root,
                 store,
-                conf,
+                bit_width,
                 hash: Default::default(),
-                flushed_cid: Some(*cid),
             }),
             None => Err(Error::CidNotFound(cid.to_string())),
         }
-    }
-    /// Lazily instantiate a hamt from this root Cid with a specified bit width.
-    pub fn load_with_bit_width(cid: &Cid, store: BS, bit_width: u32) -> Result<Self, Error> {
-        Self::load_with_config(cid, store, Config { bit_width })
     }
 
     /// Sets the root based on the Cid of the root node using the Hamt store
     pub fn set_root(&mut self, cid: &Cid) -> Result<(), Error> {
         match self.store.get_cbor(cid)? {
-            Some(root) => {
-                self.root = root;
-                self.flushed_cid = Some(*cid);
-            }
+            Some(root) => self.root = root,
             None => return Err(Error::CidNotFound(cid.to_string())),
         }
 
@@ -154,15 +140,9 @@ where
     where
         V: PartialEq,
     {
-        let (old, modified) = self
-            .root
-            .set(key, value, self.store.borrow(), &self.conf, true)?;
-
-        if modified {
-            self.flushed_cid = None;
-        }
-
-        Ok(old)
+        self.root
+            .set(key, value, self.store.borrow(), self.bit_width, true)
+            .map(|(r, _)| r)
     }
 
     /// Inserts a key-value pair into the HAMT only if that key does not already exist.
@@ -195,16 +175,9 @@ where
     where
         V: PartialEq,
     {
-        let set = self
-            .root
-            .set(key, value, self.store.borrow(), &self.conf, false)
-            .map(|(_, set)| set)?;
-
-        if set {
-            self.flushed_cid = None;
-        }
-
-        Ok(set)
+        self.root
+            .set(key, value, self.store.borrow(), self.bit_width, false)
+            .map(|(_, set)| set)
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -233,7 +206,7 @@ where
         Q: Hash + Eq,
         V: DeserializeOwned,
     {
-        match self.root.get(k, self.store.borrow(), &self.conf)? {
+        match self.root.get(k, self.store.borrow(), self.bit_width)? {
             Some(v) => Ok(Some(v)),
             None => Ok(None),
         }
@@ -264,7 +237,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        Ok(self.root.get(k, self.store.borrow(), &self.conf)?.is_some())
+        Ok(self
+            .root
+            .get(k, self.store.borrow(), self.bit_width)?
+            .is_some())
     }
 
     /// Removes a key from the HAMT, returning the value at the key if the key
@@ -292,24 +268,14 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let deleted = self.root.remove_entry(k, self.store.borrow(), &self.conf)?;
-
-        if deleted.is_some() {
-            self.flushed_cid = None;
-        }
-
-        Ok(deleted)
+        self.root
+            .remove_entry(k, self.store.borrow(), self.bit_width)
     }
 
     /// Flush root and return Cid for hamt
     pub fn flush(&mut self) -> Result<Cid, Error> {
-        if let Some(cid) = self.flushed_cid {
-            return Ok(cid);
-        }
         self.root.flush(self.store.borrow())?;
-        let cid = self.store.put_cbor(&self.root, Code::Blake2b256)?;
-        self.flushed_cid = Some(cid);
-        Ok(cid)
+        Ok(self.store.put_cbor(&self.root, Code::Blake2b256)?)
     }
 
     /// Returns true if the HAMT has no entries

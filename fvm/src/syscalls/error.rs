@@ -6,14 +6,13 @@ use derive_more::Display;
 use fvm_shared::error::ExitCode;
 use wasmtime::Trap;
 
-use crate::call_manager::NO_DATA_BLOCK_ID;
-use crate::kernel::{BlockId, ExecutionError};
+use crate::kernel::ExecutionError;
 
 /// Represents an actor "abort".
 #[derive(Debug)]
 pub enum Abort {
     /// The actor explicitly aborted with the given exit code (or panicked).
-    Exit(ExitCode, String, BlockId),
+    Exit(ExitCode, String),
     /// The actor ran out of gas.
     OutOfGas,
     /// The system failed with a fatal error.
@@ -31,7 +30,6 @@ impl Abort {
                     "actor aborted with an invalid message: {} (code={:?})",
                     e.0, e.1
                 ),
-                0,
             ),
             ExecutionError::OutOfGas => Abort::OutOfGas,
             ExecutionError::Fatal(err) => Abort::Fatal(err),
@@ -62,11 +60,7 @@ impl From<Trap> for Abort {
 
         // Actor panic/wasm error.
         if let Some(code) = t.trap_code() {
-            return Abort::Exit(
-                ExitCode::SYS_ILLEGAL_INSTRUCTION,
-                code.to_string(),
-                NO_DATA_BLOCK_ID,
-            );
+            return Abort::Exit(ExitCode::SYS_ILLEGAL_INSTRUCTION, code.to_string());
         }
 
         // Try to get a smuggled error back.

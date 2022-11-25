@@ -1,5 +1,4 @@
-use anyhow::{anyhow, Context as _};
-use fvm_shared::{sys, ActorID};
+use anyhow::anyhow;
 
 use super::Context;
 use crate::kernel::{ClassifyResult, Result};
@@ -11,29 +10,11 @@ pub fn resolve_address(
     addr_len: u32,
 ) -> Result<u64> {
     let addr = context.memory.read_address(addr_off, addr_len)?;
-    let actor_id = context.kernel.resolve_address(&addr)?;
+    let actor_id = context
+        .kernel
+        .resolve_address(&addr)?
+        .ok_or_else(|| syscall_error!(NotFound; "actor not found"))?;
     Ok(actor_id)
-}
-
-pub fn lookup_address(
-    context: Context<'_, impl Kernel>,
-    actor_id: ActorID,
-    obuf_off: u32,
-    obuf_len: u32,
-) -> Result<u32> {
-    let obuf = context.memory.try_slice_mut(obuf_off, obuf_len)?;
-    match context.kernel.lookup_address(actor_id)? {
-        Some(address) => {
-            let address = address.to_bytes();
-            obuf.get_mut(..address.len())
-                .ok_or_else(
-                    || syscall_error!(BufferTooSmall; "address output buffer is too small"),
-                )?
-                .copy_from_slice(&address);
-            Ok(address.len() as u32)
-        }
-        None => Ok(0),
-    }
 }
 
 pub fn get_actor_code_cid(
@@ -45,16 +26,22 @@ pub fn get_actor_code_cid(
     // We always check arguments _first_, before we do anything else.
     context.memory.check_bounds(obuf_off, obuf_len)?;
 
-    let typ = context.kernel.get_actor_code_cid(actor_id)?;
+    let typ = context
+        .kernel
+        .get_actor_code_cid(actor_id)?
+        .ok_or_else(|| syscall_error!(NotFound; "target actor not found"))?;
 
     context.memory.write_cid(&typ, obuf_off, obuf_len)
 }
 
 /// Generates a new actor address, and writes it into the supplied output buffer.
 ///
-/// The output buffer must be at least 21 bytes long, which is the length of a class 2 address
-/// (protocol-generated actor address).
-pub fn next_actor_address(
+/// The output buffer must be at least 21 bytes long, which is the length of a
+/// class 2 address (protocol-generated actor address). This will change in the
+/// future when we introduce class 4 addresses to accommodate larger hashes.
+///
+/// TODO(M2): this method will be merged with create_actor.
+pub fn new_actor_address(
     context: Context<'_, impl Kernel>,
     obuf_off: u32, // Address (out)
     obuf_len: u32,
@@ -71,7 +58,7 @@ pub fn next_actor_address(
     }
 
     // Create the address.
-    let addr = context.kernel.next_actor_address()?;
+    let addr = context.kernel.new_actor_address()?;
 
     // And return it.
     let bytes = addr.to_bytes();
@@ -90,21 +77,11 @@ pub fn next_actor_address(
 
 pub fn create_actor(
     context: Context<'_, impl Kernel>,
-    actor_id: u64, // ID
+    actor_id: u64, // Address
     typ_off: u32,  // Cid
-    predictable_addr_off: u32,
-    predictable_addr_len: u32,
 ) -> Result<()> {
     let typ = context.memory.read_cid(typ_off)?;
-    let addr = (predictable_addr_len > 0)
-        .then(|| {
-            context
-                .memory
-                .read_address(predictable_addr_off, predictable_addr_len)
-        })
-        .transpose()?;
-
-    context.kernel.create_actor(typ, actor_id, addr)
+    context.kernel.create_actor(typ, actor_id)
 }
 
 pub fn get_builtin_actor_type(
@@ -125,21 +102,4 @@ pub fn get_code_cid_for_type(
 
     let k = context.kernel.get_code_cid_for_type(typ as u32)?;
     context.memory.write_cid(&k, obuf_off, obuf_len)
-}
-
-#[cfg(feature = "m2-native")]
-pub fn install_actor(
-    context: Context<'_, impl Kernel>,
-    typ_off: u32, // Cid
-) -> Result<()> {
-    let typ = context.memory.read_cid(typ_off)?;
-    context.kernel.install_actor(typ)
-}
-
-pub fn balance_of(context: Context<'_, impl Kernel>, actor_id: u64) -> Result<sys::TokenAmount> {
-    let balance = context.kernel.balance_of(actor_id)?;
-    balance
-        .try_into()
-        .context("base-fee exceeds u128 limit")
-        .or_fatal()
 }

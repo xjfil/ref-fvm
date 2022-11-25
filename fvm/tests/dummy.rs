@@ -3,27 +3,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::Context;
-use cid::Cid;
 use fvm::call_manager::{Backtrace, CallManager, FinishRet, InvocationResult};
-use fvm::externs::{Chain, Consensus, Externs, Rand};
+use fvm::externs::{Consensus, Externs, Rand};
 use fvm::gas::{Gas, GasCharge, GasTracker};
-use fvm::machine::limiter::ExecMemory;
 use fvm::machine::{Engine, Machine, MachineContext, Manifest, NetworkConfig};
 use fvm::state_tree::{ActorState, StateTree};
 use fvm::{kernel, Kernel};
 use fvm_ipld_blockstore::{Blockstore, MemoryBlockstore};
-use fvm_ipld_encoding::{CborStore, DAG_CBOR};
+use fvm_ipld_encoding::CborStore;
 use fvm_shared::address::Address;
-use fvm_shared::bigint::Zero;
-use fvm_shared::econ::TokenAmount;
-use fvm_shared::event::StampedEvent;
 use fvm_shared::state::StateTreeVersion;
 use fvm_shared::version::NetworkVersion;
-use fvm_shared::{ActorID, IDENTITY_HASH};
-use multihash::{Code, Multihash};
-use wasmtime::ResourceLimiter;
+use multihash::Code;
 
-pub const STUB_NETWORK_VER: NetworkVersion = NetworkVersion::V18;
+pub const STUB_NETWORK_VER: NetworkVersion = NetworkVersion::V15;
 
 /// Unimplemented and empty `Externs` impl
 pub struct DummyExterns;
@@ -62,48 +55,6 @@ impl Consensus for DummyExterns {
     }
 }
 
-impl Chain for DummyExterns {
-    fn get_tipset_cid(&self, epoch: fvm_shared::clock::ChainEpoch) -> anyhow::Result<Cid> {
-        Ok(Cid::new_v1(
-            DAG_CBOR,
-            Multihash::wrap(IDENTITY_HASH, &epoch.to_be_bytes()).unwrap(),
-        ))
-    }
-}
-
-#[derive(Default)]
-pub struct DummyLimiter {
-    curr_exec_memory_bytes: usize,
-}
-
-impl ResourceLimiter for DummyLimiter {
-    fn memory_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> bool {
-        self.curr_exec_memory_bytes += desired - current;
-        true
-    }
-
-    fn table_growing(&mut self, _current: u32, _desired: u32, _maximum: Option<u32>) -> bool {
-        true
-    }
-}
-
-impl ExecMemory for DummyLimiter {
-    fn curr_exec_memory_bytes(&self) -> usize {
-        self.curr_exec_memory_bytes
-    }
-
-    fn with_stack_frame<T, G, F, R>(t: &mut T, g: G, f: F) -> R
-    where
-        G: Fn(&mut T) -> &mut Self,
-        F: FnOnce(&mut T) -> R,
-    {
-        let memory_bytes = g(t).curr_exec_memory_bytes;
-        let ret = f(t);
-        g(t).curr_exec_memory_bytes = memory_bytes;
-        ret
-    }
-}
-
 /// Minimal *pseudo-functional* implementation of `Machine` for tests
 pub struct DummyMachine {
     pub engine: Engine,
@@ -118,7 +69,7 @@ impl DummyMachine {
         let bs = MemoryBlockstore::new();
 
         // generate new state root
-        let mut state_tree = StateTree::new(bs, StateTreeVersion::V5)?;
+        let mut state_tree = StateTree::new(bs, StateTreeVersion::V4)?;
         let root = state_tree.flush()?;
         let bs = state_tree.into_store();
 
@@ -140,7 +91,7 @@ impl DummyMachine {
         let mut config = NetworkConfig::new(STUB_NETWORK_VER);
 
         // generate context from the new generated root and override actors with empty list
-        let ctx = config.override_actors(actors_cid).for_epoch(0, 0, root);
+        let ctx = config.override_actors(actors_cid).for_epoch(0, root);
 
         Ok(Self {
             ctx,
@@ -153,8 +104,8 @@ impl DummyMachine {
 
 impl Machine for DummyMachine {
     type Blockstore = MemoryBlockstore;
+
     type Externs = DummyExterns;
-    type Limiter = DummyLimiter;
 
     fn engine(&self) -> &Engine {
         &self.engine
@@ -208,26 +159,15 @@ impl Machine for DummyMachine {
     fn machine_id(&self) -> &str {
         todo!()
     }
-
-    fn new_limiter(&self) -> Self::Limiter {
-        DummyLimiter::default()
-    }
-
-    fn commit_events(&self, _events: &[StampedEvent]) -> kernel::Result<Option<Cid>> {
-        todo!()
-    }
 }
 
 /// Minimal *pseudo-functional* implementation CallManager
 pub struct DummyCallManager {
     pub machine: DummyMachine,
     pub gas_tracker: GasTracker,
-    pub gas_premium: TokenAmount,
-    pub origin: ActorID,
-    pub origin_address: Address,
+    pub origin: Address,
     pub nonce: u64,
     pub test_data: Rc<RefCell<TestData>>,
-    limits: DummyLimiter,
 }
 
 /// Information to be read by external tests
@@ -244,13 +184,10 @@ impl DummyCallManager {
         (
             Self {
                 machine: DummyMachine::new_stub().unwrap(),
-                gas_tracker: GasTracker::new(Gas::new(i64::MAX), Gas::new(0), false),
-                origin: 0,
+                gas_tracker: GasTracker::new(Gas::new(i64::MAX), Gas::new(0)),
+                origin: Address::new_actor(&[]),
                 nonce: 0,
                 test_data: rc,
-                limits: DummyLimiter::default(),
-                origin_address: Address::new_id(0),
-                gas_premium: TokenAmount::zero(),
             },
             cell_ref,
         )
@@ -265,12 +202,9 @@ impl DummyCallManager {
             Self {
                 machine: DummyMachine::new_stub().unwrap(),
                 gas_tracker,
-                origin: 0,
+                origin: Address::new_actor(&[]),
                 nonce: 0,
                 test_data: rc,
-                limits: DummyLimiter::default(),
-                origin_address: Address::new_id(0),
-                gas_premium: TokenAmount::zero(),
             },
             cell_ref,
         )
@@ -280,27 +214,16 @@ impl DummyCallManager {
 impl CallManager for DummyCallManager {
     type Machine = DummyMachine;
 
-    fn new(
-        machine: Self::Machine,
-        _gas_limit: i64,
-        origin: ActorID,
-        origin_address: Address,
-        nonce: u64,
-        gas_premium: TokenAmount,
-    ) -> Self {
+    fn new(machine: Self::Machine, _gas_limit: i64, origin: Address, nonce: u64) -> Self {
         let rc = Rc::new(RefCell::new(TestData {
             charge_gas_calls: 0,
         }));
-        let limits = machine.new_limiter();
         Self {
             machine,
-            gas_tracker: GasTracker::new(Gas::new(i64::MAX), Gas::new(0), false),
-            gas_premium,
+            gas_tracker: GasTracker::new(Gas::new(i64::MAX), Gas::new(0)),
             origin,
-            origin_address,
             nonce,
             test_data: rc,
-            limits,
         }
     }
 
@@ -333,7 +256,6 @@ impl CallManager for DummyCallManager {
                     cause: None,
                 },
                 exec_trace: Vec::new(),
-                events: Vec::new(),
             },
             self.machine,
         )
@@ -351,45 +273,28 @@ impl CallManager for DummyCallManager {
         &self.borrow().gas_tracker
     }
 
-    fn charge_gas(&self, charge: GasCharge) -> kernel::Result<()> {
+    fn gas_tracker_mut(&mut self) -> &mut GasTracker {
+        &mut self.gas_tracker
+    }
+
+    fn charge_gas(&mut self, charge: GasCharge) -> kernel::Result<()> {
         self.test_data.borrow_mut().charge_gas_calls += 1;
-        self.gas_tracker().apply_charge(charge)
+        self.gas_tracker_mut().apply_charge(charge)
     }
 
-    fn origin(&self) -> ActorID {
+    fn origin(&self) -> Address {
         self.origin
-    }
-
-    fn gas_premium(&self) -> &TokenAmount {
-        &self.gas_premium
     }
 
     fn nonce(&self) -> u64 {
         self.nonce
     }
 
-    fn next_actor_address(&self) -> Address {
-        todo!()
-    }
-
-    fn create_actor(
-        &mut self,
-        _code_id: Cid,
-        _actor_id: ActorID,
-        _predictable_address: Option<Address>,
-    ) -> kernel::Result<()> {
+    fn next_actor_idx(&mut self) -> u64 {
         todo!()
     }
 
     fn invocation_count(&self) -> u64 {
-        todo!()
-    }
-
-    fn limiter_mut(&mut self) -> &mut <Self::Machine as Machine>::Limiter {
-        &mut self.limits
-    }
-
-    fn append_event(&mut self, _evt: StampedEvent) {
         todo!()
     }
 }

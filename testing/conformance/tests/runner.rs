@@ -1,4 +1,3 @@
-#![cfg(ignore)]
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
@@ -8,7 +7,6 @@ use std::fs::File;
 use std::io::BufReader;
 use std::iter;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::{anyhow, Context as _};
 use async_std::{stream, sync, task};
@@ -18,28 +16,9 @@ use fvm::machine::MultiEngine;
 use fvm_conformance_tests::driver::*;
 use fvm_conformance_tests::report;
 use fvm_conformance_tests::vector::{MessageVector, Selector};
-use fvm_conformance_tests::vm::{TestStatsGlobal, TestStatsRef};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use walkdir::WalkDir;
-
-enum ErrorAction {
-    Error,
-    Warn,
-    Ignore,
-}
-
-impl FromStr for ErrorAction {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "error" => Ok(Self::Error),
-            "warn" => Ok(Self::Warn),
-            "ignore" => Ok(Self::Ignore),
-            _ => Err("must be one of error|warn|ignore".into()),
-        }
-    }
-}
 
 lazy_static! {
     /// The maximum parallelism when processing test vectors.
@@ -50,55 +29,39 @@ lazy_static! {
         }).unwrap_or_else(num_cpus::get);
 }
 
-lazy_static! {
-    /// By default a post-condition error is fatal and stops all testing. We can use this env var to relax that
-    /// and let the test carry on (optionally with a warning); there's a correctness check agains the post condition anyway.
-    static ref TEST_VECTOR_POSTCONDITION_MISSING_ACTION: ErrorAction = std::env::var_os("TEST_VECTOR_POSTCONDITION_MISSING_ACTION")
-        .map(|s| {
-            let s = s.to_str().unwrap();
-            s.parse().expect("unexpected post condition error action")
-        }).unwrap_or(ErrorAction::Warn);
-}
-
 #[async_std::test]
 async fn conformance_test_runner() -> anyhow::Result<()> {
     pretty_env_logger::init();
 
     let engines = MultiEngine::new();
 
-    let path = var("VECTOR").unwrap_or_else(|_| "test-vectors/corpus".to_owned());
-    let path = Path::new(path.as_str()).to_path_buf();
-    let stats = TestStatsGlobal::new_ref();
-
-    let vector_results = if path.is_file() {
-        let stats = stats.clone();
-        either::Either::Left(
+    let vector_results = match var("VECTOR") {
+        Ok(v) => either::Either::Left(
             iter::once(async move {
-                let res = run_vector(path.clone(), engines, stats)
+                let path = Path::new(v.as_str()).to_path_buf();
+                let res = run_vector(path.clone(), engines)
                     .await
                     .with_context(|| format!("failed to run vector: {}", path.display()))?;
                 anyhow::Ok((path, res))
             })
             .map(futures::future::Either::Left),
-        )
-    } else {
-        either::Either::Right(
-            WalkDir::new(path)
+        ),
+        Err(_) => either::Either::Right(
+            WalkDir::new("test-vectors/corpus")
                 .into_iter()
                 .filter_ok(is_runnable)
                 .map(|e| {
                     let engines = engines.clone();
-                    let stats = stats.clone();
                     async move {
                         let path = e?.path().to_path_buf();
-                        let res = run_vector(path.clone(), engines, stats)
+                        let res = run_vector(path.clone(), engines)
                             .await
                             .with_context(|| format!("failed to run vector: {}", path.display()))?;
                         Ok((path, res))
                     }
                 })
                 .map(futures::future::Either::Right),
-        )
+        ),
     };
 
     let mut results = Box::pin(
@@ -154,21 +117,6 @@ async fn conformance_test_runner() -> anyhow::Result<()> {
         .bold()
     );
 
-    if let Some(ref stats) = stats {
-        let stats = stats.lock().unwrap();
-        println!(
-            "{}",
-            format!(
-                "memory stats:\n init.min: {}\n init.max: {}\n exec.min: {}\n exec.max: {}\n",
-                stats.init.min_desired_memory_bytes,
-                stats.init.max_desired_memory_bytes,
-                stats.exec.min_desired_memory_bytes,
-                stats.exec.max_desired_memory_bytes,
-            )
-            .bold()
-        );
-    }
-
     if failed > 0 {
         Err(anyhow!("some vectors failed"))
     } else {
@@ -181,7 +129,6 @@ async fn conformance_test_runner() -> anyhow::Result<()> {
 async fn run_vector(
     path: PathBuf,
     engines: MultiEngine,
-    stats: TestStatsRef,
 ) -> anyhow::Result<impl Iterator<Item = impl Future<Output = anyhow::Result<VariantResult>>>> {
     let file = File::open(&path)?;
     let reader = BufReader::new(file);
@@ -240,21 +187,11 @@ async fn run_vector(
                     ));
                 }
                 if !imported_root.contains(&v.postconditions.state_tree.root_cid) {
-                    let msg = format!(
+                    return Err(anyhow!(
                         "imported roots ({}) do not contain postcondition CID {}",
                         imported_root.iter().join(", "),
-                        v.postconditions.state_tree.root_cid
-                    );
-
-                    match *TEST_VECTOR_POSTCONDITION_MISSING_ACTION {
-                        ErrorAction::Error => {
-                            return Err(anyhow!(msg));
-                        }
-                        ErrorAction::Warn => {
-                            eprintln!("WARN: {msg} in {}", path.display())
-                        }
-                        ErrorAction::Ignore => (),
-                    }
+                        v.preconditions.state_tree.root_cid
+                    ));
                 }
 
                 let v = sync::Arc::new(v);
@@ -265,10 +202,9 @@ async fn run_vector(
                         let engines = engines.clone();
                         let name =
                             format!("{} | {}", path.display(), &v.preconditions.variants[i].id);
-                        let stats = stats.clone();
                         futures::future::Either::Right(
                             task::Builder::new()
-                                .name(name.clone())
+                                .name(name)
                                 .spawn(async move {
                                     run_variant(
                                         bs,
@@ -276,9 +212,7 @@ async fn run_vector(
                                         &v.preconditions.variants[i],
                                         &engines,
                                         true,
-                                        stats,
                                     )
-                                    .with_context(|| format!("failed to run {name}"))
                                 })
                                 .unwrap(),
                         )
@@ -286,6 +220,6 @@ async fn run_vector(
                 ))
             }
         }
-        other => Err(anyhow!("unknown test vector class: {}", other)),
+        other => return Err(anyhow!("unknown test vector class: {}", other)),
     }
 }

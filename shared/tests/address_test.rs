@@ -1,13 +1,13 @@
 // Copyright 2019-2022 ChainSafe Systems
 // SPDX-License-Identifier: Apache-2.0, MIT
 
-use std::iter;
 use std::str::FromStr;
 
 use data_encoding::{DecodeError, DecodeKind};
 use fvm_ipld_encoding::{from_slice, Cbor};
 use fvm_shared::address::{
-    Address, Error, Protocol, BLS_PUB_LEN, MAX_SUBADDRESS_LEN, PAYLOAD_HASH_LEN, SECP_PUB_LEN,
+    checksum, validate_checksum, Address, Error, Network, Protocol, BLS_PUB_LEN, PAYLOAD_HASH_LEN,
+    SECP_PUB_LEN,
 };
 
 #[test]
@@ -40,6 +40,16 @@ fn key_len_validations() {
     assert!(Address::new_secp256k1(&[8; SECP_PUB_LEN + 1]).is_err());
 }
 
+#[test]
+fn generate_validate_checksum() {
+    let data = [0, 2, 3, 4, 5, 1, 2];
+    let other_data = [1, 4, 3, 6, 7, 1, 2];
+    let cksm = checksum(&data);
+    assert_eq!(cksm.len(), 4);
+    assert!(validate_checksum(&data, cksm.clone()));
+    assert!(!validate_checksum(&other_data, cksm));
+}
+
 struct AddressTestVec<'a> {
     input: &'a [u8],
     expected: &'static str,
@@ -47,7 +57,7 @@ struct AddressTestVec<'a> {
 
 fn test_address(addr: Address, protocol: Protocol, expected: &'static str) {
     // Test encoding to string
-    assert_eq!(expected, &addr.to_string());
+    assert_eq!(expected.to_owned(), addr.to_string());
 
     // Test decoding from string
     let decoded = Address::from_str(expected).unwrap();
@@ -219,37 +229,6 @@ fn bls_address() {
 }
 
 #[test]
-fn delegated_address() {
-    struct F4TestVec {
-        namespace: u64,
-        subaddr: &'static [u8],
-        expected: &'static str,
-    }
-    let test_vectors = &[
-        F4TestVec {
-            namespace: 32,
-            subaddr: &[0xff; 5],
-            expected: "f432f77777777x32lpna",
-        },
-        F4TestVec {
-            namespace: std::u64::MAX,
-            subaddr: &[],
-            expected: "f418446744073709551615ftnkyfaq",
-        },
-        F4TestVec {
-            namespace: std::u64::MAX,
-            subaddr: &[0; MAX_SUBADDRESS_LEN],
-            expected: "f418446744073709551615faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaafbbuagu",
-        },
-    ];
-
-    for t in test_vectors.iter() {
-        let addr = Address::new_delegated(t.namespace, t.subaddr).unwrap();
-        test_address(addr, Protocol::Delegated, t.expected);
-    }
-}
-
-#[test]
 fn id_address() {
     struct IDTestVec {
         input: u64,
@@ -312,7 +291,7 @@ fn invalid_string_addresses() {
             expected: Error::UnknownNetwork,
         },
         StringAddrVec {
-            input: "f5gfvuyh7v2sx3patm5k23wdzmhyhtmqctasbr23y",
+            input: "f4gfvuyh7v2sx3patm5k23wdzmhyhtmqctasbr23y",
             expected: Error::UnknownProtocol,
         },
         StringAddrVec {
@@ -345,20 +324,12 @@ fn invalid_string_addresses() {
             input: "f2",
             expected: Error::InvalidLength,
         },
-        StringAddrVec {
-            input: "f1mzxqu",
-            expected: Error::InvalidLength,
-        },
     ];
 
-    for (i, t) in test_vectors.iter().enumerate() {
+    for t in test_vectors.iter() {
         let res = Address::from_str(t.input);
         match res {
-            Err(e) => assert_eq!(
-                e, t.expected,
-                "test case {} with input {} failed",
-                i, t.input
-            ),
+            Err(e) => assert_eq!(e, t.expected),
             _ => panic!("Addresses should have errored"),
         };
     }
@@ -392,7 +363,7 @@ fn invalid_byte_addresses() {
     let test_vectors = &[
         // Unknown Protocol
         StringAddrVec {
-            input: vec![5, 4, 4],
+            input: vec![4, 4, 4],
             expected: Error::UnknownProtocol,
         },
         // ID protocol
@@ -426,18 +397,6 @@ fn invalid_byte_addresses() {
         StringAddrVec {
             input: bls_s,
             expected: Error::InvalidPayloadLength(47),
-        },
-        // Delegate Protocol
-        StringAddrVec {
-            input: [4, 0]
-                .into_iter()
-                .chain(iter::repeat(0xff).take(MAX_SUBADDRESS_LEN + 1))
-                .collect(),
-            expected: Error::InvalidPayloadLength(MAX_SUBADDRESS_LEN + 1),
-        },
-        StringAddrVec {
-            input: vec![4, 0xff],
-            expected: Error::InvalidPayload,
         },
     ];
 
@@ -585,6 +544,31 @@ fn address_hashmap() {
 
     // validate original value was not overriden
     assert_eq!(hm.get(&h1).unwrap(), &1);
+}
+
+#[test]
+fn set_network() {
+    // Assert network can be chained when printing string
+    let mut addr: Address = from_slice(&[66, 0, 1]).unwrap();
+    assert_eq!(addr.network(), Network::Mainnet);
+    assert_eq!(addr.set_network(Network::Testnet).to_string(), "t01");
+
+    // Assert network can be set before printing
+    let mut addr: Address = from_slice(&[66, 0, 1]).unwrap();
+    assert_eq!(addr.network(), Network::Mainnet);
+    addr.set_network(Network::Testnet);
+    assert_eq!(addr.network(), Network::Testnet);
+    assert_eq!(addr.to_string(), "t01");
+}
+
+#[test]
+fn from_string_retains_network() {
+    let addr_str = "f01";
+    let addr: Address = addr_str.parse().unwrap();
+    assert_eq!(addr.network(), Network::Mainnet);
+
+    let addr_to_string = addr.to_string();
+    assert_eq!(addr_str, &addr_to_string);
 }
 
 #[test]
